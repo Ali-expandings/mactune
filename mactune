@@ -1,0 +1,946 @@
+#!/bin/bash
+# =============================================================================
+#  mactune — the honest macOS tune-up
+#  https://github.com/Ali-expandings/mactune              MIT License
+#
+#  Works on any Mac: Apple Silicon or Intel, macOS 11 (Big Sur) → 26 (Tahoe).
+#  Pure bash 3.2 (the /bin/bash every Mac ships) — zero dependencies.
+#
+#  Philosophy (the part most "optimizers" get wrong):
+#    A tool that does not know your machine must DIAGNOSE and do only SAFE,
+#    REVERSIBLE maintenance. It must not disable Apple services, blanket-purge
+#    caches, or flip security settings — those help one known machine and harm
+#    an unknown one. Sources: Apple Support "If your Mac runs slowly",
+#    Howard Oakley / Eclectic Light, and study of tw93/mole.
+#
+#  File removals are routed to Trash (recoverable). A few actions are one-way
+#  by nature and are NOT reversible: brew cleanup, `purge`, and a Spotlight
+#  reindex — these are rebuildable by the system, never your data, and each
+#  is opt-in. Everything mutating is gated behind a prompt or a measured
+#  threshold.
+#
+#  Quick start:           mactune
+#  Read-only first run:   mactune --dry-run
+#  All options:           mactune --help
+# =============================================================================
+
+set -u
+export LC_ALL=C
+
+VERSION="2.0.0"
+
+DRY_RUN="${DRY_RUN:-0}"
+NO_SUDO="${NO_SUDO:-0}"
+ASSUME_YES="${ASSUME_YES:-0}"
+ANSWERS="${ANSWERS:-}"                 # manual | all | saved  (empty = ask at startup)
+RESET="${RESET:-0}"                    # RESET=1 wipes the saved-answers profile
+MODE="${MODE:-}"                       # clean | rollback  (empty = ask at startup)
+PREFS="${MACTUNE_PREFS:-$HOME/.config/mactune/answers.conf}"
+HIST="${MACTUNE_HISTORY:-$HOME/.config/mactune/history.csv}"
+
+usage() {
+  cat <<'EOF'
+mactune — the honest macOS tune-up
+Diagnoses what is actually slow, does only safe & reversible maintenance,
+and scores your Mac's health 0-100 with history across runs.
+
+USAGE
+  mactune [options]
+
+OPTIONS
+  -n, --dry-run     read-only pass: show everything it would do, change nothing
+  -y, --yes         answer yes to every optional step (same as ANSWERS=all)
+      --no-sudo     skip the admin (sudo) section entirely
+      --rollback    undo mactune's UI tweaks (restore animations & transparency)
+      --reset       forget the saved answers profile, ask everything again
+  -v, --version     print version and exit
+  -h, --help        show this help and exit
+
+ENVIRONMENT
+  DRY_RUN=1 NO_SUDO=1 ASSUME_YES=1 MODE=clean|rollback RESET=1
+  ANSWERS=manual|all|saved   how optional steps are answered
+  MACTUNE_PREFS    saved-answers file   (default ~/.config/mactune/answers.conf)
+  MACTUNE_HISTORY  health-score history (default ~/.config/mactune/history.csv)
+
+FILES
+  ~/.config/mactune/answers.conf   your saved answers ("saved" mode)
+  ~/.config/mactune/history.csv    one row per run: date, score, key metrics
+
+Everything it trashes goes to ~/.Trash — recoverable until you empty it.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    --no-sudo)    NO_SUDO=1 ;;
+    --rollback)   MODE=rollback ;;
+    --reset)      RESET=1 ;;
+    -v|--version) printf 'mactune %s\n' "$VERSION"; exit 0 ;;
+    -h|--help)    usage; exit 0 ;;
+    *) printf 'mactune: unknown option %s (try --help)\n' "$1" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+# ---- palette: muted, refined; 256-colour with graceful fallback ------------
+if [ -t 1 ]; then
+  C_ACCENT=$'\033[38;5;179m'   # champagne gold — the single accent
+  C_OK=$'\033[38;5;108m'       # sage green
+  C_WARN=$'\033[38;5;173m'     # terracotta
+  C_DIM=$'\033[38;5;245m'      # quiet grey
+  C_INFO=$'\033[38;5;179m'     # section headers share the accent
+  C_BOLD=$'\033[1m'; C_RST=$'\033[0m'
+else
+  C_ACCENT=; C_OK=; C_INFO=; C_WARN=; C_DIM=; C_BOLD=; C_RST=
+fi
+ok()   { printf '   %s✓%s  %s\n' "$C_OK" "$C_RST" "$1"; }
+info() {
+  printf '\n %s▌%s %s%s%s\n' "$C_ACCENT" "$C_RST" "$C_BOLD" "$1" "$C_RST"
+  # If the header is "N/T  Label", advance the sticky bottom bar to step N.
+  case "$1" in
+    [0-9]*/[0-9]*)
+      local s="$1" step tot lbl
+      step="${s%%/*}"
+      tot="${s#*/}"; tot="${tot%%[![:digit:]]*}"
+      lbl="${s#*/}"; lbl="${lbl#"$tot"}"
+      while [ "${lbl# }" != "$lbl" ]; do lbl="${lbl# }"; done
+      TOTAL_STEPS="$tot"; progress "$step" "$lbl"
+      ;;
+  esac
+}
+skip() { printf '   %s·%s  %s%s%s\n' "$C_DIM" "$C_RST" "$C_DIM" "$1" "$C_RST"; }
+warn() { printf '   %s▲%s  %s\n' "$C_WARN" "$C_RST" "$1"; }
+note() { printf '     %s%s%s\n' "$C_DIM" "$1" "$C_RST"; }
+
+# ---- health score ledger -----------------------------------------------------
+# Every measured problem subtracts points and records WHY, so the final score
+# is fully explainable — no vibes, only the numbers gathered during diagnosis.
+SCORE=100
+REASONS=""
+pen() {  # pen <points> <reason>
+  SCORE=$(( SCORE - $1 ))
+  REASONS="${REASONS}     -$1  $2\n"
+}
+
+# ---- reclaimed-space tally ----------------------------------------------------
+RECLAIMED_KB=0
+
+# ---- understated braille spinner; also serves as a timed wait ---------------
+# spin <seconds> <message>   — animates for ~N seconds, then clears the line.
+# Falls back to a plain sleep when stdout isn't a terminal.
+spin() {
+  local secs="$1" msg="$2"
+  if [ ! -t 1 ]; then sleep "$secs"; return 0; fi
+  local frames; frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  local end=$(( $(date +%s) + secs )) i=0
+  while [ "$(date +%s)" -lt "$end" ]; do
+    i=$(( (i + 1) % 10 ))
+    printf '\r   %s%s%s  %s%s%s' "$C_ACCENT" "${frames[$i]}" "$C_RST" "$C_DIM" "$msg" "$C_RST"
+    sleep 0.08
+  done
+  printf '\r\033[K'
+}
+
+# ---- sticky progress bar pinned to the terminal's bottom row ----------------
+# A DEC scroll region reserves the last line; all normal output scrolls ABOVE
+# it, so the overall 1→7 progress bar stays visible however far you scroll.
+# The EXIT/INT/TERM trap always restores the terminal; WINCH re-pins on resize.
+# Entirely no-op when stdout is not a TTY.
+PROG_ON=0; TOTAL_STEPS=7; BAR_STEP=0; BAR_LABEL=""; ROWS=24; COLS=80; START_TS=0
+bar_setup() {
+  [ -t 1 ] || return 0
+  ROWS=$(tput lines 2>/dev/null || echo 24)
+  COLS=$(tput cols 2>/dev/null || echo 80)
+  [ "${ROWS:-0}" -lt 6 ] && { PROG_ON=0; return 0; }
+  PROG_ON=1; START_TS=$(date +%s)
+  printf '\n'                          # reserve a spare line for the bar
+  printf '\033[1;%dr' "$((ROWS - 1))"  # scroll region = top .. second-to-last
+  printf '\033[%d;1H' "$((ROWS - 1))"  # drop the cursor back into that region
+}
+bar_teardown() {
+  [ "$PROG_ON" = "1" ] || return 0
+  PROG_ON=0
+  printf '\033[r'                      # release the scroll region
+  printf '\033[%d;1H\033[2K' "$ROWS"   # wipe the reserved bar line
+}
+bar_draw() {
+  [ "$PROG_ON" = "1" ] || return 0
+  # Sub-cell smooth fill: eighth-block glyphs (U+258F..U+2588) give 8 levels of
+  # horizontal resolution per character, so the fill boundary lands precisely
+  # instead of snapping to whole cells (technique per mike42 / Unicode block
+  # elements). Width adapts to the window, leaving room for pct / count / clock.
+  local width=$(( COLS - 34 ))
+  [ "$width" -gt 32 ] && width=32
+  [ "$width" -lt 10 ] && width=10
+  local eighths=$(( BAR_STEP * width * 8 / TOTAL_STEPS ))
+  local full=$(( eighths / 8 )) rem=$(( eighths % 8 ))
+  local parts; parts=("" "▏" "▎" "▍" "▌" "▋" "▊" "▉")
+  local fill="" track="" i=0
+  while [ "$i" -lt "$full" ]; do fill="${fill}█"; i=$(( i + 1 )); done
+  if [ "$rem" -gt 0 ] && [ "$full" -lt "$width" ]; then fill="${fill}${parts[$rem]}"; fi
+  local trackn=$(( width - full )); [ "$rem" -gt 0 ] && trackn=$(( trackn - 1 ))
+  i=0; while [ "$i" -lt "$trackn" ]; do track="${track}░"; i=$(( i + 1 )); done
+  local pct=$(( BAR_STEP * 100 / TOTAL_STEPS ))
+  local el=$(( $(date +%s) - START_TS )) clock
+  clock=$(printf '%d:%02d' "$(( el / 60 ))" "$(( el % 60 ))")
+  printf '\0337'                       # save cursor
+  printf '\033[%d;1H\033[2K' "$ROWS"   # jump to the reserved line, clear it
+  printf ' %s▌%s %s%s%s%s%s%s %s%3d%%%s  %s%d/%d%s  %s%s%s  %s%s%s' \
+    "$C_ACCENT" "$C_RST" \
+    "$C_ACCENT" "$fill" "$C_RST" "$C_DIM" "$track" "$C_RST" \
+    "$C_BOLD" "$pct" "$C_RST" \
+    "$C_DIM" "$BAR_STEP" "$TOTAL_STEPS" "$C_RST" \
+    "$C_BOLD" "$BAR_LABEL" "$C_RST" \
+    "$C_DIM" "$clock" "$C_RST"
+  printf '\0338'                       # restore cursor
+}
+progress() { BAR_STEP="$1"; BAR_LABEL="$2"; bar_draw; }
+on_winch() {
+  [ "$PROG_ON" = "1" ] || return 0
+  ROWS=$(tput lines 2>/dev/null || echo 24)
+  COLS=$(tput cols 2>/dev/null || echo 80)
+  printf '\033[1;%dr' "$((ROWS - 1))"
+  bar_draw
+}
+trap 'bar_teardown' EXIT INT TERM
+trap 'on_winch' WINCH
+
+# ---- dry-run-aware action wrapper -------------------------------------------
+# run "<human label>" cmd args...   — executes unless DRY_RUN=1.
+run() {
+  local label="$1"; shift
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '  %s[dry-run]%s %s\n' "$C_WARN" "$C_RST" "$label"
+    return 0
+  fi
+  "$@"
+}
+
+# ---- saved-answers profile (mode 3): a tiny key=value store -----------------
+prefs_get() {                          # prefs_get <key> -> echoes y|n, exit 1 if absent
+  [ -f "$PREFS" ] || return 1
+  awk -F= -v k="$1" '$1==k{print $2; f=1; exit} END{exit !f}' "$PREFS"
+}
+prefs_set() {                          # prefs_set <key> <value>  (overwrites in place)
+  mkdir -p "$(dirname "$PREFS")" 2>/dev/null || return 1
+  touch "$PREFS" 2>/dev/null || return 1
+  local tmp="$PREFS.tmp.$$"
+  grep -v "^$1=" "$PREFS" 2>/dev/null > "$tmp"
+  printf '%s=%s\n' "$1" "$2" >> "$tmp"
+  mv "$tmp" "$PREFS"
+}
+
+# ---- y/n prompt, default No.  Behaviour set by $ANSWERS ----------------------
+#   all → auto-yes      manual → ask every run      saved → ask once, then reuse
+#   confirm <key> <prompt>   — <key> names the answer in the saved profile.
+confirm() {
+  local key="$1" prompt="$2" reply="" saved=""
+  [ "$DRY_RUN" = "1" ] && return 0     # dry-run: reveal every opt-in branch
+  case "$ANSWERS" in
+    all) return 0 ;;
+    saved)
+      if saved=$(prefs_get "$key"); then
+        [ "$saved" = "y" ] && return 0 || return 1
+      fi
+      [ -t 0 ] || return 1             # no saved value + non-interactive → decline
+      printf '  %s?%s %s %s[y/N]%s ' "$C_INFO" "$C_RST" "$prompt" "$C_DIM" "$C_RST"
+      read -r reply </dev/tty 2>/dev/null || return 1
+      case "$reply" in
+        [yY]|[yY][eE][sS]) prefs_set "$key" y; return 0 ;;
+        *)                 prefs_set "$key" n; return 1 ;;
+      esac ;;
+    *)   # manual (default)
+      [ -t 0 ] || return 1             # non-interactive: decline opt-ins
+      printf '  %s?%s %s [y/N] ' "$C_INFO" "$C_RST" "$prompt"
+      read -r reply </dev/tty 2>/dev/null || return 1
+      case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac ;;
+  esac
+}
+
+# ---- choose how the optional steps get answered: manual | all | saved -------
+# Precedence: explicit $ANSWERS > legacy ASSUME_YES=1 > saved profile > ask.
+answers_select() {
+  case "$ANSWERS" in manual|all|saved) return ;; esac
+  [ "$ASSUME_YES" = "1" ] && { ANSWERS=all; return; }
+  if [ -f "$PREFS" ] && grep -q '^__mode__=saved' "$PREFS" 2>/dev/null; then
+    ANSWERS=saved
+    note "Using saved answers — $PREFS  (redo: RESET=1 mactune)"
+    return
+  fi
+  if [ ! -t 0 ]; then ANSWERS=manual; return; fi
+  printf '  %sHow should I handle the optional steps?%s\n' "$C_BOLD" "$C_RST"
+  printf '    1) Ask me each time          %s(default)%s\n' "$C_DIM" "$C_RST"
+  printf '    2) Yes to everything\n'
+  printf '    3) Save my answers, reuse    %severy run after%s\n' "$C_DIM" "$C_RST"
+  printf '  Choose [1/2/3]: '
+  local a=""; read -r a </dev/tty 2>/dev/null || a=1
+  case "$a" in
+    2) ANSWERS=all ;;
+    3) ANSWERS=saved; prefs_set __mode__ saved
+       note "Saved profile on — I'll remember each answer below." ;;
+    *) ANSWERS=manual ;;
+  esac
+  echo
+}
+
+# ---- human-readable bytes ---------------------------------------------------
+human() {
+  local b="${1:-0}"
+  awk -v b="$b" 'BEGIN{
+    split("B KB MB GB TB",u," "); i=1;
+    while (b>=1024 && i<5){b/=1024;i++}
+    printf (i==1)?"%d %s":"%.1f %s", b, u[i]
+  }'
+}
+
+# Trash routing so every deletion is recoverable.
+TRASH="$HOME/.Trash"
+trash_it() {
+  local p="$1"
+  [ -e "$p" ] || return 1
+  [ -L "$p" ] && return 1   # never follow/move a symlink — no traversal surprises
+  local base; base=$(basename "$p")
+  local dest="$TRASH/$base"
+  local n=2
+  while [ -e "$dest" ]; do dest="$TRASH/${base}.$n"; n=$((n+1)); done
+  run "move to Trash: $p" /bin/mv "$p" "$dest"
+}
+
+# ---- developer-cache offer: measure → confirm → Trash (reversible) -----------
+# cache_offer <answers-key> <label> <path> <min_kb>
+# Only fires when the path exists AND exceeds the threshold. The whole cache
+# directory goes to Trash (recoverable), and the tool that owns it rebuilds it
+# on next use. Adds the size to the reclaimed tally.
+cache_offer() {
+  local key="$1" label="$2" path="$3" min="$4" kb=0
+  [ -e "$path" ] || return 1
+  kb=$(du -sk "$path" 2>/dev/null | cut -f1); kb="${kb:-0}"
+  [ "$kb" -gt "$min" ] || return 1
+  dev_found=1
+  if confirm "$key" "$label is $(human $(( kb * 1024 ))). Move it to Trash? (rebuilt on next use)"; then
+    if trash_it "$path"; then
+      RECLAIMED_KB=$(( RECLAIMED_KB + kb ))
+      ok "$label → Trash ($(human $(( kb * 1024 ))) reclaimed)"
+    fi
+  else
+    skip "$label kept"
+  fi
+  return 0
+}
+
+# Rollback: undo exactly the UI keys MacTune's section 4 writes, restoring the
+# stock macOS look (animations + transparency back on). `defaults delete` of an
+# absent key is a harmless no-op. Touches nothing else.
+rollback_ui() {
+  info "Rollback — restoring default macOS UI (animations & transparency back on)"
+  if [ "$DRY_RUN" = "1" ]; then
+    note "[dry-run] would delete: reduceTransparency, reduceMotion, ReduceMotionEnabled,"
+    note "[dry-run]              NSWindowResizeTime, NSAutomaticWindowAnimationsEnabled"
+    ok "[dry-run] UI would be restored to macOS defaults"
+    return 0
+  fi
+  defaults delete com.apple.universalaccess reduceTransparency 2>/dev/null
+  defaults delete com.apple.universalaccess reduceMotion 2>/dev/null
+  defaults delete com.apple.Accessibility ReduceMotionEnabled 2>/dev/null
+  defaults delete -g NSWindowResizeTime 2>/dev/null
+  defaults delete NSGlobalDomain NSAutomaticWindowAnimationsEnabled 2>/dev/null
+  # NOTE: do NOT killall cfprefsd here — it flushes a stale cached copy back to
+  # disk, resurrecting the keys just deleted. `defaults delete` already persists.
+  killall Dock 2>/dev/null
+  killall Finder 2>/dev/null
+  ok "UI restored to macOS defaults — animations & transparency are back on"
+  note "Log out and back in if any effect lingers."
+}
+
+# =============================================================================
+#  0. Machine profile  (drives every later decision)
+# =============================================================================
+ARCH=$(uname -m)                                   # arm64 | x86_64
+OS_VER=$(sw_vers -productVersion 2>/dev/null)      # e.g. 15.5 or 26.0
+MODEL=$(sysctl -n hw.model 2>/dev/null)
+RAM_BYTES=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+RAM_GB=$(( RAM_BYTES / 1024 / 1024 / 1024 ))
+CPU=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+NCPU=$(sysctl -n hw.ncpu 2>/dev/null)
+if [ "$ARCH" = "arm64" ]; then PLATFORM="Apple Silicon"; else PLATFORM="Intel"; fi
+
+clear 2>/dev/null
+spin 1 "Preparing report…"
+printf '\n %s▌%s %sMACTUNE%s %sv%s%s\n'  "$C_ACCENT" "$C_RST" "$C_BOLD" "$C_RST" "$C_ACCENT" "$VERSION" "$C_RST"
+printf ' %s▌%s %sthe honest macOS tune-up%s\n' "$C_ACCENT" "$C_RST" "$C_DIM" "$C_RST"
+printf '   %s────────────────────────────────────────%s\n' "$C_DIM" "$C_RST"
+printf '   %s%s%s  ·  %s  ·  %s GB  ·  %s cores\n' "$C_BOLD" "$PLATFORM" "$C_RST" "${MODEL:-Mac}" "$RAM_GB" "${NCPU:-?}"
+printf '   %smacOS %s  ·  %s%s\n' "$C_DIM" "${OS_VER:-?}" "${CPU:-CPU}" "$C_RST"
+[ "$DRY_RUN" = "1" ] && printf '   %s▲ DRY RUN — nothing will be changed%s\n' "$C_WARN" "$C_RST"
+echo
+
+# =============================================================================
+#  Mode select: ask up front what the user wants. Override with MODE=clean
+#  or MODE=rollback. Non-interactive (piped/launchd) defaults to clean.
+# =============================================================================
+if [ -z "$MODE" ]; then
+  if [ -t 0 ]; then
+    printf '  %sWhat do you want to do?%s\n' "$C_BOLD" "$C_RST"
+    printf '    1) Clean     — diagnose + safe maintenance  %s(default)%s\n' "$C_DIM" "$C_RST"
+    printf '    2) Roll back — undo MacTune'\''s UI changes (restore animations & transparency)\n'
+    printf '  Choose [1/2]: '
+    read -r _m </dev/tty 2>/dev/null || _m=1
+    case "$_m" in
+      2|r|R|rollback|Rollback|ROLLBACK) MODE=rollback ;;
+      *) MODE=clean ;;
+    esac
+    echo
+  else
+    MODE=clean
+  fi
+fi
+
+if [ "$MODE" = "rollback" ]; then
+  rollback_ui
+  printf '\n   %s────────────────────────────────────────%s\n' "$C_DIM" "$C_RST"
+  [ -t 0 ] && { printf '   %sPress any key to close…%s' "$C_DIM" "$C_RST"; read -r -n 1 _ </dev/tty 2>/dev/null; echo; }
+  exit 0
+fi
+
+# Clear the saved-answers profile on request, then settle this run's answer mode
+# (manual | all | saved). Skipped in dry-run — confirm() auto-reveals branches.
+if [ "$RESET" = "1" ] && [ -f "$PREFS" ]; then
+  rm -f "$PREFS" && printf '   %s· saved answers cleared (%s)%s\n' "$C_DIM" "$PREFS" "$C_RST"
+fi
+[ "$DRY_RUN" = "1" ] || answers_select
+
+# =============================================================================
+#  1. Diagnosis  (read-only — the most valuable section)
+#     Apple + Oakley agree: the real levers are memory pressure, free disk,
+#     login items, and runaway processes — not "RAM cleaning". Everything
+#     measured here feeds the health score in section 7.
+# =============================================================================
+bar_setup   # pin the overall-progress bar to the bottom row for the whole run
+info "1/7  Diagnosis"
+
+# -- Uptime: Apple's first fix is a restart; say when one is overdue --
+BOOT_SEC=$(sysctl -n kern.boottime 2>/dev/null | awk -F'[ ,]+' '{print $4}')
+NOW_SEC=$(date +%s)
+UP_DAYS=0
+if [ -n "${BOOT_SEC:-}" ] && [ "${BOOT_SEC:-0}" -gt 0 ] 2>/dev/null; then
+  UP_DAYS=$(( (NOW_SEC - BOOT_SEC) / 86400 ))
+  UP_HRS=$(( ((NOW_SEC - BOOT_SEC) % 86400) / 3600 ))
+  if [ "$UP_DAYS" -ge 14 ]; then
+    warn "Uptime ${UP_DAYS} days — a restart is overdue (clears leaked memory & stale state)"
+    pen 5 "no restart in ${UP_DAYS} days"
+  else
+    ok "Uptime ${UP_DAYS}d ${UP_HRS}h"
+  fi
+fi
+
+# -- Memory pressure (the correct metric, not "free RAM"); sampled once --
+MP_OUT=$(memory_pressure 2>/dev/null)
+MP_FREE=$(printf '%s' "$MP_OUT" | awk -F': ' '/percentage/{print $2}')
+MP_FREE=${MP_FREE:-?}
+if printf '%s' "$MP_OUT" | grep -Eqi 'critical'; then
+  warn "Memory pressure CRITICAL — close apps or add RAM (free: ${MP_FREE})"
+  pen 30 "memory pressure critical"
+elif printf '%s' "$MP_OUT" | grep -Eqi 'warning'; then
+  warn "Memory pressure ELEVATED (free: ${MP_FREE}) — swap is in use"
+  pen 15 "memory pressure elevated"
+else
+  ok "Memory pressure healthy (free: ${MP_FREE})"
+fi
+
+# -- Swap: static usage AND live in/out rate (the thrash signal) --
+SWAP_USED=$(sysctl -n vm.swapusage 2>/dev/null | awk '{print $6}')
+[ -n "${SWAP_USED:-}" ] && note "Swap used: ${SWAP_USED} (occasional swap is normal; sustained = short on RAM)"
+# vm_stat exposes cumulative Swapins/Swapouts; a nonzero delta over 1s = active
+# thrash right now, which is far more diagnostic than the static snapshot above.
+si1=$(vm_stat 2>/dev/null | awk -F: '/Swapins/{gsub(/[ .]/,"",$2);print $2}')
+so1=$(vm_stat 2>/dev/null | awk -F: '/Swapouts/{gsub(/[ .]/,"",$2);print $2}')
+if [ -n "${si1:-}" ] && [ "$DRY_RUN" != "1" ]; then
+  spin 1 "Sampling memory pressure…"
+  si2=$(vm_stat 2>/dev/null | awk -F: '/Swapins/{gsub(/[ .]/,"",$2);print $2}')
+  so2=$(vm_stat 2>/dev/null | awk -F: '/Swapouts/{gsub(/[ .]/,"",$2);print $2}')
+  d_in=$(( ${si2:-0} - ${si1:-0} )); d_out=$(( ${so2:-0} - ${so1:-0} ))
+  if [ "$d_in" -gt 0 ] || [ "$d_out" -gt 0 ]; then
+    warn "Active swapping NOW (+${d_in} in / +${d_out} out per sec) — RAM is the bottleneck"
+    pen 15 "actively swapping to disk"
+  fi
+fi
+
+# -- Who is actually using the memory and CPU.
+#    Memory is aggregated per APP: modern apps split into dozens of helper
+#    processes (a browser is 30+), so a raw per-process list both undercounts
+#    the real owners and previously carried a bug — `ps -r` sorts by CPU, so
+#    the old "Top by RAM" list was not sorted by RAM at all. Summing RSS per
+#    .app bundle answers the question people open Activity Monitor to ask. --
+PS_RSS=$(ps -Aero rss,comm 2>/dev/null)
+PS_CPU=$(ps -Aero pcpu,comm 2>/dev/null)
+echo
+note "Memory by app (helper processes summed):"
+printf '%s\n' "$PS_RSS" | awk '
+  NR>1 {
+    rss=$1; $1=""; path=$0; sub(/^ /,"",path)
+    if (match(path, /\/[^\/]+\.app\//)) {
+      app=substr(path, RSTART+1, RLENGTH-6)     # first .app segment = owning app
+    } else {
+      n=split(path, parts, "/"); app=parts[n]   # bare daemons: basename
+    }
+    sum[app]+=rss; cnt[app]++
+  }
+  END { for (k in sum) printf "%d\t%d\t%s\n", sum[k], cnt[k], k }' \
+  | sort -rn | head -5 | while IFS="$(printf '\t')" read -r kb cnt app; do
+      if [ "${cnt:-1}" -gt 1 ]; then
+        printf '      %8s  %s %s(%s processes)%s\n' "$(human $(( kb * 1024 )) )" "$app" "$C_DIM" "$cnt" "$C_RST"
+      else
+        printf '      %8s  %s\n' "$(human $(( kb * 1024 )) )" "$app"
+      fi
+    done
+note "Top 5 by CPU:"
+printf '%s\n' "$PS_CPU" | sed -n '2,6p' | while read -r pc comm; do
+  printf '      %5s%%  %s\n' "$pc" "$(basename "$comm")"
+done
+HOG=$(printf '%s\n' "$PS_CPU" | sed -n '2p')
+HOG_CPU=$(printf '%s' "$HOG" | awk '{print int($1)}')
+HOG_NAME=$(printf '%s' "$HOG" | awk '{$1="";sub(/^ /,"");n=split($0,a,"/");print a[n]}')
+if [ "${HOG_CPU:-0}" -ge 80 ]; then
+  warn "Runaway: ${HOG_NAME} at ${HOG_CPU}% CPU — if it stays here, quit/relaunch it"
+  pen 10 "runaway process: ${HOG_NAME}"
+fi
+# WindowServer working hard = the UI itself is expensive (transparency,
+# animations, external displays). Section 4's toggle directly lowers this.
+WS_CPU=$(printf '%s\n' "$PS_CPU" | awk '/WindowServer/{print int($1); exit}')
+if [ "${WS_CPU:-0}" -ge 25 ]; then
+  note "WindowServer at ${WS_CPU}% CPU — UI effects are costing real cycles (see step 4)"
+fi
+# Spotlight indexing or a Time Machine backup running RIGHT NOW explains a slow
+# "right now" better than any cache ever will. Say so instead of guessing.
+MDS_CPU=$(printf '%s\n' "$PS_CPU" | awk '/mds_stores|mdworker/{ if (int($1) > m) m=int($1) } END{print m+0}')
+if [ "${MDS_CPU:-0}" -ge 10 ]; then
+  note "Spotlight is indexing right now (${MDS_CPU}% CPU) — normal after updates/big file changes; let it finish"
+fi
+if tmutil status 2>/dev/null | grep -q 'Running = 1'; then
+  note "Time Machine backup in progress — temporary slowness during backup is normal"
+fi
+echo
+
+# -- Free disk (Apple: low free space is a top cause of slowness) --
+read -r DISK_USEP DISK_AVAIL <<EOF
+$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5" "$4}')
+EOF
+if [ -n "${DISK_USEP:-}" ]; then
+  DISK_AVAIL_H=$(human $(( ${DISK_AVAIL:-0} * 1024 )) )
+  if [ "${DISK_USEP:-0}" -ge 90 ]; then
+    warn "Disk ${DISK_USEP}% full (${DISK_AVAIL_H} free) — below 10% free, macOS slows badly"
+    pen 25 "disk ${DISK_USEP}% full"
+  elif [ "${DISK_USEP:-0}" -ge 85 ]; then
+    note "Disk ${DISK_USEP}% full (${DISK_AVAIL_H} free) — getting tight, keep >15% free"
+    pen 10 "disk ${DISK_USEP}% full"
+  else
+    ok "Disk ${DISK_USEP}% full (${DISK_AVAIL_H} free)"
+  fi
+fi
+
+# -- Disk hotspot map: WHERE the space went (read-only, ~1s).
+#    Only well-known reclaimable/reviewable locations, only entries >1 GB. --
+HOTSPOTS=""
+while IFS='|' read -r hp_label hp_path; do
+  [ -e "$hp_path" ] || continue
+  hp_kb=$(du -sk "$hp_path" 2>/dev/null | cut -f1); hp_kb="${hp_kb:-0}"
+  [ "$hp_kb" -ge 1048576 ] && HOTSPOTS="${HOTSPOTS}${hp_kb}|${hp_label}
+"
+done <<EOF
+Trash|$HOME/.Trash
+Downloads folder|$HOME/Downloads
+User app caches (~/Library/Caches)|$HOME/Library/Caches
+iPhone/iPad backups|$HOME/Library/Application Support/MobileSync/Backup
+Docker disk image|$HOME/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw
+Xcode DerivedData|$HOME/Library/Developer/Xcode/DerivedData
+EOF
+if [ -n "$HOTSPOTS" ]; then
+  note "Disk hotspots (>1 GB — where the space went):"
+  printf '%s' "$HOTSPOTS" | sort -t'|' -k1,1rn | while IFS='|' read -r hp_kb hp_label; do
+    [ -n "$hp_kb" ] && printf '      %8s  %s\n' "$(human $(( hp_kb * 1024 )) )" "$hp_label"
+  done
+fi
+
+# -- Disk hardware health: a dying disk is the slowness nobody checks for --
+SMART=$(diskutil info disk0 2>/dev/null | awk -F': *' '/SMART Status/{print $2}')
+case "${SMART:-}" in
+  Verified) ok "Disk SMART status: Verified" ;;
+  "")       ;;  # external/virtual setups may not expose disk0 — stay silent
+  *[Ff]ail*)
+    warn "Disk SMART status: ${SMART} — BACK UP NOW and have the disk checked"
+    pen 40 "disk reports SMART ${SMART}" ;;
+  *)        note "Disk SMART status: ${SMART}" ;;
+esac
+
+# -- Battery health (laptops): an aged battery slows the whole machine —
+#    macOS quietly caps performance when the battery can't deliver power. --
+if pmset -g batt 2>/dev/null | grep -q InternalBattery; then
+  BATT=$(system_profiler SPPowerDataType 2>/dev/null)
+  B_CYCLES=$(printf '%s' "$BATT" | awk '/Cycle Count/{print $3; exit}')
+  B_COND=$(printf '%s' "$BATT"  | awk -F': ' '/Condition/{print $2; exit}')
+  B_CAP=$(printf '%s' "$BATT"   | awk '/Maximum Capacity/{gsub(/%/,"",$3); print $3; exit}')
+  if [ -n "${B_CAP:-}" ]; then
+    if [ "${B_COND:-Normal}" != "Normal" ]; then
+      warn "Battery: ${B_CAP}% capacity, ${B_CYCLES:-?} cycles, condition '${B_COND}' — service recommended"
+      pen 10 "battery condition: ${B_COND}"
+    elif [ "${B_CAP:-100}" -lt 80 ]; then
+      warn "Battery: ${B_CAP}% of original capacity (${B_CYCLES:-?} cycles) — aging; macOS may cap peak power"
+      pen 5 "battery at ${B_CAP}% capacity"
+    else
+      ok "Battery: ${B_CAP}% capacity, ${B_CYCLES:-?} cycles, condition ${B_COND:-Normal}"
+    fi
+  fi
+fi
+
+# -- Thermal throttling.  CPU_Speed_Limit is an Intel/SMC field; it does NOT
+#    exist on Apple Silicon, so the old "print OK if absent" logic reported a
+#    false all-clear on every M-series Mac. Report honestly per platform;
+#    Apple Silicon gets a real sample in the admin section (powermetrics). --
+if [ "$PLATFORM" = "Intel" ]; then
+  THERM=$(pmset -g therm 2>/dev/null | awk -F'= ' '/CPU_Speed_Limit/{print $2}')
+  if [ -n "${THERM:-}" ] && [ "${THERM}" != "100" ]; then
+    warn "Thermal throttling: CPU capped at ${THERM}% — let it cool / check runaway load"
+    pen 10 "thermal throttling at ${THERM}%"
+  else
+    ok "Thermals OK (no CPU throttling)"
+  fi
+  # FileVault on Intel (no T2) costs real disk I/O — worth knowing, not changing.
+  if fdesetup status 2>/dev/null | grep -q 'On'; then
+    note "FileVault is on — on Intel Macs this costs some disk speed (a fair security trade)"
+  fi
+else
+  note "Thermals: sampled in the admin section below (powermetrics needs sudo)"
+fi
+
+# -- Login items + third-party background services: the #1 boot/idle lever --
+LI_LIST=$(osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null)
+if [ -n "${LI_LIST:-}" ]; then
+  LI_COUNT=$(printf '%s' "$LI_LIST" | awk -F', ' '{print NF}')
+  if [ "${LI_COUNT:-0}" -ge 8 ]; then
+    warn "Login items: ${LI_COUNT} (${LI_LIST}) — trim these, each one slows login & idle"
+    pen 5 "${LI_COUNT} login items"
+  else
+    ok "Login items: ${LI_COUNT} (${LI_LIST})"
+  fi
+else
+  ok "Login items: none"
+fi
+AGENTS=$(launchctl list 2>/dev/null | awk 'NR>1 && $3 !~ /^com\.apple\./{n++} END{print n+0}')
+if [ "${AGENTS:-0}" -ge 12 ]; then
+  warn "Third-party background services: ${AGENTS} running — audit them (System Settings → General → Login Items)"
+  pen 5 "${AGENTS} third-party background services"
+elif [ "${AGENTS:-0}" -gt 0 ]; then
+  note "Third-party background services running: ${AGENTS}"
+fi
+
+# -- Stability: crash & panic reports from the last 7 days. A chronically
+#    crashing app burns CPU respawning; a kernel panic is a hardware/driver
+#    red flag that no cache cleanup will ever fix. --
+CR_FILES=$( { find "$HOME/Library/Logs/DiagnosticReports" -name '*.ips' -mtime -7 2>/dev/null
+              find /Library/Logs/DiagnosticReports -name '*.ips' -mtime -7 2>/dev/null; } )
+# grep -c prints a count even when it exits nonzero (zero matches), so take its
+# output as-is — appending a fallback would double the "0".
+CR_COUNT=$(printf '%s' "$CR_FILES" | grep -c . 2>/dev/null); CR_COUNT="${CR_COUNT:-0}"
+PANICS=$(printf '%s' "$CR_FILES" | grep -ci 'panic' 2>/dev/null); PANICS="${PANICS:-0}"
+JETSAMS=$(printf '%s' "$CR_FILES" | grep -ci 'jetsam' 2>/dev/null); JETSAMS="${JETSAMS:-0}"
+if [ "${PANICS:-0}" -gt 0 ]; then
+  warn "Kernel panic report(s) in the last 7 days: ${PANICS} — hardware/driver issue; check Apple Diagnostics (boot holding D)"
+  pen 15 "kernel panic this week"
+fi
+if [ "${JETSAMS:-0}" -gt 0 ]; then
+  warn "Jetsam event(s) this week: ${JETSAMS} — macOS force-killed processes to free memory; RAM ran out"
+  pen 5 "system killed processes for memory"
+fi
+TOP_CRASHER=""
+if [ "${CR_COUNT:-0}" -gt 5 ]; then
+  TOP_CRASHER=$(printf '%s\n' "$CR_FILES" | sed 's/.*\///; s/[-_][0-9].*//' | sort | uniq -c | sort -rn | head -1 | awk '{$1="";sub(/^ /,"");print}')
+  CRASHER_N=$(printf '%s\n' "$CR_FILES" | sed 's/.*\///; s/[-_][0-9].*//' | sort | uniq -c | sort -rn | head -1 | awk '{print $1}')
+  case "$TOP_CRASHER" in
+    com.apple.*)
+      warn "Crash reports this week: ${CR_COUNT} (most frequent: ${TOP_CRASHER} ×${CRASHER_N} — a macOS component)"
+      note "an Apple service crashing repeatedly usually clears with a restart; if not, it's an OS/hardware issue — no cache cleanup will fix it" ;;
+    *)
+      warn "Crash reports this week: ${CR_COUNT} (most frequent: ${TOP_CRASHER} ×${CRASHER_N}) — update or reinstall it" ;;
+  esac
+  pen 5 "${CR_COUNT} crash reports this week"
+elif [ "${CR_COUNT:-0}" -gt 0 ]; then
+  note "Crash reports this week: ${CR_COUNT} (occasional crashes are normal)"
+else
+  ok "No crash reports in the last 7 days"
+fi
+
+# -- Optional: is it the Mac, or the internet? networkQuality (macOS 12+)
+#    settles the single most common misdiagnosis. ~20s, so always opt-in. --
+if [ "$DRY_RUN" != "1" ] && command -v networkQuality >/dev/null 2>&1; then
+  if confirm net_test "Test network speed & responsiveness? (~20s — rules the internet in/out as the culprit)"; then
+    networkQuality 2>/dev/null || note "network test could not run (offline?)"
+  fi
+fi
+echo
+
+# =============================================================================
+#  2. Safe maintenance  (no sudo, always reversible)
+# =============================================================================
+info "2/7  Safe maintenance"
+
+# -- Broken user LaunchAgents: program binary genuinely missing --
+# Conservative: only ~/Library/LaunchAgents, only absolute paths that don't
+# exist, and never an item whose binary sits on an unplugged /Volumes disk.
+broken=0
+if [ -d "$HOME/Library/LaunchAgents" ]; then
+  for plist in "$HOME/Library/LaunchAgents/"*.plist; do
+    [ -f "$plist" ] || continue
+    bin=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$plist" 2>/dev/null) \
+      || bin=$(/usr/libexec/PlistBuddy -c "Print :Program" "$plist" 2>/dev/null) || bin=""
+    case "$bin" in
+      /Volumes/*)
+        vol=${bin#/Volumes/}; vol=${vol%%/*}
+        [ -d "/Volumes/$vol" ] || continue ;;   # drive offline, not broken
+      /*) ;;                                     # absolute path: checkable
+      *) continue ;;                             # bare name resolves via PATH
+    esac
+    if [ ! -e "$bin" ]; then
+      run "unload + trash broken agent: $(basename "$plist")" \
+        launchctl bootout "gui/$(id -u)/$(basename "${plist%.plist}")" 2>/dev/null
+      trash_it "$plist" && { ok "broken login agent removed: $(basename "$plist")"; note "(its program was gone: $bin)"; broken=$((broken+1)); }
+    fi
+  done
+fi
+[ "$broken" -eq 0 ] && skip "no broken login agents"
+
+# -- QuickLook thumbnail + icon cache refresh (auto-rebuilt) --
+run "rebuild QuickLook cache" qlmanage -r cache >/dev/null 2>&1
+ql="$HOME/Library/Caches/com.apple.QuickLook.thumbnailcache"
+[ -d "$ql" ] && trash_it "$ql" >/dev/null 2>&1
+ok "QuickLook thumbnail cache refreshed"
+
+# -- DNS resolver cache (fixes stale-DNS connectivity, harmless, no sudo) --
+run "flush DNS resolver cache" dscacheutil -flushcache >/dev/null 2>&1
+ok "DNS resolver cache flushed"
+
+# =============================================================================
+#  3. Developer caches  (opt-in; only offered when present AND big)
+#     These trade disk for a slower next build, so they are NOT automatic.
+#     Each goes to Trash whole — recoverable until you empty the Trash, unlike
+#     the tools' own one-way `clean` commands.
+# =============================================================================
+info "3/7  Developer caches (opt-in)"
+dev_found=0
+cache_offer npm_cache   "npm cache"            "$HOME/.npm/_cacache"                        307200   # >300 MB
+cache_offer xcode_dd    "Xcode DerivedData"    "$HOME/Library/Developer/Xcode/DerivedData"  512000   # >500 MB
+cache_offer pip_cache   "pip cache"            "$HOME/Library/Caches/pip"                   204800   # >200 MB
+cache_offer yarn_cache  "Yarn cache"           "$HOME/Library/Caches/Yarn"                  204800
+cache_offer pnpm_store  "pnpm store"           "$HOME/Library/pnpm/store"                   204800
+cache_offer cargo_cache "Cargo registry cache" "$HOME/.cargo/registry/cache"                204800
+if command -v brew >/dev/null 2>&1; then
+  if confirm brew_cleanup "Run 'brew cleanup' to prune old formula versions? (one-way, rebuilds on demand)"; then
+    dev_found=1
+    BREW_CACHE_DIR=$(brew --cache 2>/dev/null)
+    bkb1=0; [ -n "${BREW_CACHE_DIR:-}" ] && bkb1=$(du -sk "$BREW_CACHE_DIR" 2>/dev/null | cut -f1)
+    run "brew cleanup --prune=all" brew cleanup --prune=all >/dev/null 2>&1
+    bkb2=0; [ -n "${BREW_CACHE_DIR:-}" ] && bkb2=$(du -sk "$BREW_CACHE_DIR" 2>/dev/null | cut -f1)
+    bdiff=$(( ${bkb1:-0} - ${bkb2:-0} )); [ "$bdiff" -lt 0 ] && bdiff=0
+    RECLAIMED_KB=$(( RECLAIMED_KB + bdiff ))
+    ok "Homebrew cleaned up$( [ "$bdiff" -gt 0 ] && printf ' (%s reclaimed)' "$(human $(( bdiff * 1024 )) )" )"
+  fi
+fi
+[ "$dev_found" -eq 0 ] && skip "no large developer caches (or skipped)"
+
+# =============================================================================
+#  4. UI responsiveness  (opt-in; perceived speed, fully reversible)
+#     Reduce Motion/Transparency measurably lowers WindowServer load on
+#     low-RAM and integrated-GPU Macs. Reversible in System Settings.
+# =============================================================================
+info "4/7  UI responsiveness (opt-in)"
+RT=$(defaults read com.apple.universalaccess reduceTransparency 2>/dev/null || echo 0)
+if [ "$RT" = "1" ]; then
+  skip "Reduce Transparency already on"
+else
+  if confirm ui_reduce "Reduce transparency & motion? (lighter on GPU/WindowServer, reversible)"; then
+    # Write BOTH the legacy universalaccess domain AND the modern Accessibility
+    # domain that Ventura+ System Settings actually reads — otherwise the toggle
+    # in Settings won't reflect the change and the effect may not apply live.
+    run "set reduceTransparency"  defaults write com.apple.universalaccess reduceTransparency -bool true
+    run "set reduceMotion"        defaults write com.apple.universalaccess reduceMotion -bool true
+    run "set ReduceMotion (mod.)" defaults write com.apple.Accessibility ReduceMotionEnabled -int 1
+    run "speed window resize"     defaults write -g NSWindowResizeTime -float 0.001
+    run "disable window anims"    defaults write NSGlobalDomain NSAutomaticWindowAnimationsEnabled -bool false
+    # Restart Dock/Finder to pick up changes (race-free); avoid killing cfprefsd.
+    run "restart Dock"            killall Dock 2>/dev/null
+    run "restart Finder"          killall Finder 2>/dev/null
+    ok "UI set to performance mode (undo: System Settings → Accessibility → Display & Motion)"
+    note "(log out / back in for full effect on WindowServer)"
+  else
+    skip "UI effects left as-is"
+  fi
+fi
+
+# =============================================================================
+#  5. System level  (sudo; each step gated and reversible)
+# =============================================================================
+info "5/7  System level (needs admin password)"
+SUDO_OK=0
+if [ "$NO_SUDO" = "1" ]; then
+  skip "system section skipped (NO_SUDO=1)"
+elif [ "$DRY_RUN" = "1" ]; then
+  skip "system section: dry-run, not authenticating"
+elif confirm admin_section "Run the admin section now? (you'll be asked for your password)"; then
+  if sudo -v 2>/dev/null; then SUDO_OK=1; fi
+fi
+
+if [ "$SUDO_OK" = "1" ]; then
+  # -- Apple Silicon thermal pressure: the honest reading section 1 promised.
+  #    powermetrics is read-only; one 1s sample. --
+  if [ "$PLATFORM" = "Apple Silicon" ]; then
+    TH=$(sudo powermetrics -n1 -i1 -s thermal 2>/dev/null | awk -F': *' '/[Pp]ressure [Ll]evel/{print $2; exit}')
+    case "${TH:-}" in
+      Nominal) ok "Thermal pressure: Nominal (no heat throttling)" ;;
+      "")      note "thermal sample unavailable on this system" ;;
+      *)       warn "Thermal pressure: ${TH} — the SoC is hot; check load, vents, direct sun"
+               pen 10 "thermal pressure ${TH}" ;;
+    esac
+  fi
+
+  # -- Time Machine local snapshots: real, silent disk consumer --
+  snaps=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple')
+  if [ "${snaps:-0}" -gt 0 ]; then
+    # Gated like every sibling action, and at low urgency (1) not max (4): only
+    # reclaim if the OS agrees space is wanted, so we never interrupt a backup
+    # chain on a Mac that has plenty of free disk.
+    if confirm thin_snapshots "Thin ${snaps} local Time Machine snapshot(s)? (frees purgeable disk)"; then
+      run "thin $snaps local snapshot(s)" sudo tmutil thinlocalsnapshots / 999999999999 1 >/dev/null 2>&1
+      ok "requested thinning of $snaps local snapshot(s)"
+    else
+      skip "snapshot thinning declined"
+    fi
+  else
+    skip "no local Time Machine snapshots"
+  fi
+
+  # -- purge ONLY under genuine memory pressure (otherwise it is placebo
+  #    that slows the next few minutes; per Oakley/Apple). Fresh reading —
+  #    pressure may have changed since section 1. --
+  if memory_pressure 2>/dev/null | grep -Eqi 'warning|critical'; then
+    run "purge inactive memory" sudo purge >/dev/null 2>&1
+    ok "released inactive memory (was under pressure)"
+  else
+    skip "memory pressure normal — purge would be counter-productive"
+  fi
+
+  # -- Spotlight reindex ONLY when search is measurably slow (mds runaway).
+  #    Never blanket — a rebuild costs 1–2h of indexing. --
+  slow=0
+  for _ in 1 2; do
+    s=$(date +%s); mdfind "kMDItemFSName == 'Applications'" >/dev/null 2>&1; e=$(date +%s)
+    [ $(( e - s )) -gt 3 ] && slow=$((slow+1))
+  done
+  if [ "$slow" -ge 2 ]; then
+    if confirm spotlight_reindex "Spotlight search is slow. Rebuild its index? (background, 1–2h)"; then
+      run "rebuild Spotlight index" sudo mdutil -E / >/dev/null 2>&1
+      ok "Spotlight reindex started (continues in background)"
+    else
+      skip "Spotlight reindex declined"
+    fi
+  else
+    skip "Spotlight responsive — no reindex needed"
+  fi
+
+  # -- Low Power Mode: report + offer (some users want it ON for battery). --
+  LPM=$(pmset -g 2>/dev/null | awk '/lowpowermode/{print $2}')
+  if [ "${LPM:-0}" = "1" ]; then
+    if confirm low_power_off "Low Power Mode is ON (caps performance). Turn it OFF?"; then
+      run "disable low power mode" sudo pmset -a lowpowermode 0
+      ok "Low Power Mode disabled"
+    else
+      skip "Low Power Mode kept on"
+    fi
+  fi
+else
+  skip "admin section not run"
+fi
+
+# =============================================================================
+#  6. Platform-specific guidance  (no blind action — tells the truth per chip)
+# =============================================================================
+info "6/7  Platform notes"
+if [ "$PLATFORM" = "Apple Silicon" ]; then
+  note "Apple Silicon: no SMC, and NVRAM self-tests every boot — no manual reset exists."
+  note "If something's wrong: full shutdown, wait 30s, power on. That's the equivalent."
+  [ "$RAM_GB" -le 8 ] && note "8 GB shared RAM: browsers + Electron apps are your real ceiling. Keep tabs lean."
+else
+  note "Intel Mac: if you see fan/power/display oddities, an SMC reset can help."
+  note "  SMC (laptop, T2): shutdown, hold Ctrl+Opt+Shift 7s, add power button 7s, release, boot."
+  note "NVRAM reset: boot holding Option+Cmd+P+R until the second chime/logo flash."
+  note "Intel + FileVault has a real I/O cost; that's a security/speed trade-off only you can make."
+fi
+echo
+
+# =============================================================================
+#  7. Health score  (every point traceable to a measurement above)
+# =============================================================================
+info "7/7  Health score"
+[ "$SCORE" -lt 0 ] && SCORE=0
+if   [ "$SCORE" -ge 90 ]; then GRADE="A"; G_COL="$C_OK"
+elif [ "$SCORE" -ge 80 ]; then GRADE="B"; G_COL="$C_OK"
+elif [ "$SCORE" -ge 70 ]; then GRADE="C"; G_COL="$C_WARN"
+elif [ "$SCORE" -ge 55 ]; then GRADE="D"; G_COL="$C_WARN"
+else                           GRADE="F"; G_COL="$C_WARN"
+fi
+printf '\n   %s%s%s  %s%s%s/100\n' "$G_COL$C_BOLD" "$GRADE" "$C_RST" "$C_BOLD" "$SCORE" "$C_RST"
+if [ -n "$REASONS" ]; then
+  printf '%b' "$C_DIM$REASONS$C_RST"
+else
+  note "no issues found — this Mac is healthy"
+fi
+
+# -- Trend vs the previous run (history survives across runs) --
+if [ -f "$HIST" ]; then
+  PREV_LINE=$(tail -1 "$HIST" 2>/dev/null)
+  PREV_SCORE=$(printf '%s' "$PREV_LINE" | awk -F, 'NF>=2 && $2+0==$2 {print $2}')
+  PREV_DATE=$(printf '%s' "$PREV_LINE" | awk -F, '{print $1}')
+  if [ -n "${PREV_SCORE:-}" ]; then
+    DELTA=$(( SCORE - PREV_SCORE ))
+    if   [ "$DELTA" -gt 0 ]; then note "trend: +${DELTA} since ${PREV_DATE} (was ${PREV_SCORE})"
+    elif [ "$DELTA" -lt 0 ]; then note "trend: ${DELTA} since ${PREV_DATE} (was ${PREV_SCORE})"
+    else                          note "trend: unchanged since ${PREV_DATE}"
+    fi
+  fi
+fi
+if [ "$DRY_RUN" != "1" ]; then
+  mkdir -p "$(dirname "$HIST")" 2>/dev/null
+  [ -f "$HIST" ] || printf 'date,score,grade,mem_free_pct,disk_used_pct,reclaimed_kb\n' > "$HIST" 2>/dev/null
+  printf '%s,%s,%s,%s,%s,%s\n' "$(date +%F)" "$SCORE" "$GRADE" "${MP_FREE%%%}" "${DISK_USEP:-}" "$RECLAIMED_KB" >> "$HIST" 2>/dev/null
+fi
+echo
+
+# -- What actually moves the needle (tailored to today's findings) --
+note "What actually moves the needle:"
+[ "${DISK_USEP:-0}" -ge 85 ] && note "• Free up disk — you're past 85%; start with the hotspots listed in step 1."
+[ "${UP_DAYS:-0}" -ge 14 ]   && note "• Restart this Mac — ${UP_DAYS} days of leaked memory and stale state."
+[ -n "${B_CAP:-}" ] && [ "${B_CAP:-100}" -lt 80 ] && note "• Battery at ${B_CAP}% capacity — consider a battery service (System Settings → Battery)."
+if [ "${CR_COUNT:-0}" -gt 5 ] && [ -n "${TOP_CRASHER:-}" ]; then
+  case "$TOP_CRASHER" in
+    com.apple.*) note "• ${TOP_CRASHER} (macOS component) keeps crashing — restart; if it persists, it's an OS/hardware issue." ;;
+    *)           note "• ${TOP_CRASHER} keeps crashing — update, reinstall, or replace it." ;;
+  esac
+fi
+[ "${JETSAMS:-0}" -gt 0 ]    && note "• Memory ran out hard enough that macOS killed processes — fewer simultaneous apps, or more RAM."
+note "• Trim Login Items: System Settings → General → Login Items (fewer = faster boot & idle)."
+note "• Restart weekly — clears leaked memory and stale state (Apple's own first step)."
+note "• Don't install 'memory cleaner' apps — purging cache makes the next minutes slower."
+note "• Match RAM to your work: if pressure is regularly red, only more RAM truly fixes it."
+echo
+bar_teardown   # release the bottom bar so the closing summary prints normally
+printf '\n   %s────────────────────────────────────────%s\n' "$C_DIM" "$C_RST"
+if [ "$DRY_RUN" = "1" ]; then
+  printf '   %s▌%s Dry run complete — re-run without DRY_RUN=1 to apply.\n' "$C_ACCENT" "$C_RST"
+else
+  printf '   %s▌%s %sDone.%s Safe to re-run anytime.\n' "$C_ACCENT" "$C_RST" "$C_BOLD" "$C_RST"
+  [ "$RECLAIMED_KB" -gt 0 ] && printf '   %s▌%s Reclaimed this run: %s%s%s\n' "$C_ACCENT" "$C_RST" "$C_BOLD" "$(human $(( RECLAIMED_KB * 1024 )) )" "$C_RST"
+fi
+printf '   %sMade by Ali Assem · linktr.ee/ali_tech_space%s\n' "$C_DIM" "$C_RST"
+echo
+[ -t 0 ] && { printf '   %sPress any key to close…%s' "$C_DIM" "$C_RST"; read -r -n 1 _ </dev/tty 2>/dev/null; echo; }
+exit 0   # always report success after a clean run, regardless of tty/stdin state

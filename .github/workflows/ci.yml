@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: syntax + smoke (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash syntax check
+        run: |
+          bash -n mactune
+          sh -n install.sh
+
+      - name: flags
+        run: |
+          ./mactune --version
+          ./mactune --help >/dev/null
+          if ./mactune --bogus 2>/dev/null; then echo "should have failed"; exit 1; fi
+
+      - name: dry run (read-only full pass)
+        run: ./mactune --dry-run </dev/null
+
+      - name: real run, non-interactive, no sudo
+        run: ./mactune --no-sudo </dev/null
+
+      - name: rollback path
+        run: MODE=rollback ./mactune </dev/null
+
+      - name: installer (sandboxed prefix)
+        run: |
+          sh install.sh --prefix "$RUNNER_TEMP/bin"
+          "$RUNNER_TEMP/bin/mactune" --version
