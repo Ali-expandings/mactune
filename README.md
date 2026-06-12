@@ -26,31 +26,7 @@
 
 One self-contained bash script. Runs on the `/bin/bash` every Mac ships (bash 3.2), from macOS 11 Big Sur through macOS 26 Tahoe, Apple Silicon and Intel. No dependencies, no daemon, no telemetry, nothing resident — it runs, reports, and exits.
 
-```
- ▌ MACTUNE v2.0.0
- ▌ the honest macOS tune-up
-
- ▌ 1/7  Diagnosis
-   ✓  Uptime 1d 9h
-   ✓  Memory pressure healthy (free: 42%)
-
-     Memory by app (helper processes summed):
-        1.8 GB  Zen (26 processes)
-      611.8 MB  Spotify (7 processes)
-      510.4 MB  Visual Studio Code (11 processes)
-   ▲  Runaway: fileproviderd at 117% CPU — if it stays here, quit/relaunch it
-   ✓  Disk 62% full (77.7 GB free)
-   ✓  Disk SMART status: Verified
-   ✓  Battery: 82% capacity, 657 cycles, condition Normal
-   ▲  Jetsam event(s) this week: 1 — macOS force-killed processes to free memory
-
- ▌ 7/7  Health score
-
-   B  85/100
-     -10  runaway process: fileproviderd
-     -5   system killed processes for memory
-     trend: -5 since 2026-06-04 (was 90)
-```
+![MacTune running: diagnosis, safe maintenance, health score](docs/demo.gif)
 
 ## Install
 
@@ -148,6 +124,22 @@ This is the actual product. The rules a tool must follow when it doesn't know yo
 | 6+ crash reports this week | −5 |
 
 90+ A · 80+ B · 70+ C · 55+ D · below F
+
+![Health score with every penalty traced to a measurement](docs/score.png)
+
+## MacTune vs. the cleaner apps
+
+If you're looking for a free, open-source alternative to CleanMyMac-style cleaners, the honest difference is the order of operations:
+
+| | MacTune | Typical cleaner app |
+|---|---|---|
+| Price | Free, MIT | $30–50/year |
+| Source | One bash file, readable in a sitting | Closed binary |
+| First move | Measure: memory pressure, SMART, jetsam, battery | Delete caches |
+| The big number | 0–100 score, every point traced to a measurement | "GB freed" that refills itself by tomorrow |
+| Deletions | To Trash, recoverable | Usually gone |
+| Lives on your Mac | Nothing resident, runs and exits | Menu-bar agent + background services |
+| When the problem is hardware | Says so | Sells you more cleaning |
 
 ## FAQ
 
