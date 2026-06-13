@@ -72,7 +72,7 @@ On first run it asks how to handle optional steps: ask each time, yes to everyth
 
 ## What it measures (the part that matters)
 
-Most "Mac cleaners" delete caches and call it speed. Apple's own guidance, and people who study macOS internals for a living (Howard Oakley / Eclectic Light), agree the real levers are elsewhere — so that is what MacTune measures:
+Most "Mac cleaners" delete caches and call it speed. Apple's own slow-Mac guidance and Howard Oakley's macOS internals writing point somewhere else entirely, and that is where MacTune measures:
 
 - **Memory pressure** — the correct metric (not "free RAM", which macOS keeps low by design), plus a live swap-rate sample to catch active thrashing in the act.
 - **Memory by app, truthfully** — a modern browser is 30+ helper processes; per-process lists undercount the real owners. MacTune sums them per app, which is the question you actually opened Activity Monitor to ask.
@@ -85,7 +85,7 @@ Most "Mac cleaners" delete caches and call it speed. Apple's own guidance, and p
 - **Startup load** — login items and third-party background services, counted, not guessed.
 - **Is it even the Mac?** — optional 20-second Apple `networkQuality` test, because half of "my Mac is slow" is the internet.
 
-Everything measured feeds a **health score (0–100, graded A–F)** where every lost point is traceable to a measurement — no vibes. Each run appends to `~/.config/mactune/history.csv`, so the next run shows your trend.
+Everything measured feeds a **health score (0–100, graded A–F)** where every lost point is traceable to a measurement. Each run appends to `~/.config/mactune/history.csv`, so the next run shows your trend.
 
 ## What it fixes (only the safe part)
 

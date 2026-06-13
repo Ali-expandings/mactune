@@ -4,18 +4,18 @@
 #  https://github.com/Ali-expandings/mactune              MIT License
 #
 #  Works on any Mac: Apple Silicon or Intel, macOS 11 (Big Sur) → 26 (Tahoe).
-#  Pure bash 3.2 (the /bin/bash every Mac ships) — zero dependencies.
+#  Pure bash 3.2, the /bin/bash every Mac ships. Zero dependencies.
 #
 #  Philosophy (the part most "optimizers" get wrong):
 #    A tool that does not know your machine must DIAGNOSE and do only SAFE,
 #    REVERSIBLE maintenance. It must not disable Apple services, blanket-purge
-#    caches, or flip security settings — those help one known machine and harm
+#    caches, or flip security settings; those help one known machine and harm
 #    an unknown one. Sources: Apple Support "If your Mac runs slowly",
 #    Howard Oakley / Eclectic Light, and study of tw93/mole.
 #
 #  File removals are routed to Trash (recoverable). A few actions are one-way
 #  by nature and are NOT reversible: brew cleanup, `purge`, and a Spotlight
-#  reindex — these are rebuildable by the system, never your data, and each
+#  reindex. Those get rebuilt by the system, never your data, and each
 #  is opt-in. Everything mutating is gated behind a prompt or a measured
 #  threshold.
 #
@@ -116,7 +116,7 @@ note() { printf '     %s%s%s\n' "$C_DIM" "$1" "$C_RST"; }
 
 # ---- health score ledger -----------------------------------------------------
 # Every measured problem subtracts points and records WHY, so the final score
-# is fully explainable — no vibes, only the numbers gathered during diagnosis.
+# comes straight from the numbers gathered during diagnosis.
 SCORE=100
 REASONS=""
 pen() {  # pen <points> <reason>
@@ -128,7 +128,7 @@ pen() {  # pen <points> <reason>
 RECLAIMED_KB=0
 
 # ---- understated braille spinner; also serves as a timed wait ---------------
-# spin <seconds> <message>   — animates for ~N seconds, then clears the line.
+# spin <seconds> <message>: animates for ~N seconds, then clears the line.
 # Falls back to a plain sleep when stdout isn't a terminal.
 spin() {
   local secs="$1" msg="$2"
@@ -208,7 +208,7 @@ trap 'bar_teardown' EXIT INT TERM
 trap 'on_winch' WINCH
 
 # ---- dry-run-aware action wrapper -------------------------------------------
-# run "<human label>" cmd args...   — executes unless DRY_RUN=1.
+# run "<human label>" cmd args...  runs the command unless DRY_RUN=1.
 run() {
   local label="$1"; shift
   if [ "$DRY_RUN" = "1" ]; then
@@ -234,7 +234,7 @@ prefs_set() {                          # prefs_set <key> <value>  (overwrites in
 
 # ---- y/n prompt, default No.  Behaviour set by $ANSWERS ----------------------
 #   all → auto-yes      manual → ask every run      saved → ask once, then reuse
-#   confirm <key> <prompt>   — <key> names the answer in the saved profile.
+#   confirm <key> <prompt>, where <key> names the answer in the saved profile.
 confirm() {
   local key="$1" prompt="$2" reply="" saved=""
   [ "$DRY_RUN" = "1" ] && return 0     # dry-run: reveal every opt-in branch
@@ -346,7 +346,7 @@ rollback_ui() {
   defaults delete com.apple.Accessibility ReduceMotionEnabled 2>/dev/null
   defaults delete -g NSWindowResizeTime 2>/dev/null
   defaults delete NSGlobalDomain NSAutomaticWindowAnimationsEnabled 2>/dev/null
-  # NOTE: do NOT killall cfprefsd here — it flushes a stale cached copy back to
+  # NOTE: do NOT killall cfprefsd here. It flushes a stale cached copy back to
   # disk, resurrecting the keys just deleted. `defaults delete` already persists.
   killall Dock 2>/dev/null
   killall Finder 2>/dev/null
@@ -355,7 +355,7 @@ rollback_ui() {
 }
 
 # =============================================================================
-#  0. Machine profile  (drives every later decision)
+#  0. Machine profile. Everything later branches on this.
 # =============================================================================
 ARCH=$(uname -m)                                   # arm64 | x86_64
 OS_VER=$(sw_vers -productVersion 2>/dev/null)      # e.g. 15.5 or 26.0
@@ -405,17 +405,17 @@ if [ "$MODE" = "rollback" ]; then
 fi
 
 # Clear the saved-answers profile on request, then settle this run's answer mode
-# (manual | all | saved). Skipped in dry-run — confirm() auto-reveals branches.
+# (manual | all | saved). Skipped in dry-run, where confirm() auto-reveals branches.
 if [ "$RESET" = "1" ] && [ -f "$PREFS" ]; then
   rm -f "$PREFS" && printf '   %s· saved answers cleared (%s)%s\n' "$C_DIM" "$PREFS" "$C_RST"
 fi
 [ "$DRY_RUN" = "1" ] || answers_select
 
 # =============================================================================
-#  1. Diagnosis  (read-only — the most valuable section)
-#     Apple + Oakley agree: the real levers are memory pressure, free disk,
-#     login items, and runaway processes — not "RAM cleaning". Everything
-#     measured here feeds the health score in section 7.
+#  1. Diagnosis. Read-only, and where most of the value is.
+#     Apple's slow-Mac support doc and Howard Oakley's writing both point at
+#     the same suspects: memory pressure, free disk, login items, runaway
+#     processes. Everything measured here feeds the health score in section 7.
 # =============================================================================
 bar_setup   # pin the overall-progress bar to the bottom row for the whole run
 info "1/7  Diagnosis"
@@ -435,7 +435,7 @@ if [ -n "${BOOT_SEC:-}" ] && [ "${BOOT_SEC:-0}" -gt 0 ] 2>/dev/null; then
   fi
 fi
 
-# -- Memory pressure (the correct metric, not "free RAM"); sampled once --
+# -- Memory pressure, sampled once. Low "free RAM" is normal on macOS; pressure is what counts. --
 MP_OUT=$(memory_pressure 2>/dev/null)
 MP_FREE=$(printf '%s' "$MP_OUT" | awk -F': ' '/percentage/{print $2}')
 MP_FREE=${MP_FREE:-?}
@@ -470,7 +470,7 @@ fi
 # -- Who is actually using the memory and CPU.
 #    Memory is aggregated per APP: modern apps split into dozens of helper
 #    processes (a browser is 30+), so a raw per-process list both undercounts
-#    the real owners and previously carried a bug — `ps -r` sorts by CPU, so
+#    the real owners and previously carried a bug: `ps -r` sorts by CPU, so
 #    the old "Top by RAM" list was not sorted by RAM at all. Summing RSS per
 #    .app bundle answers the question people open Activity Monitor to ask. --
 PS_RSS=$(ps -Aero rss,comm 2>/dev/null)
@@ -574,8 +574,8 @@ case "${SMART:-}" in
   *)        note "Disk SMART status: ${SMART}" ;;
 esac
 
-# -- Battery health (laptops): an aged battery slows the whole machine —
-#    macOS quietly caps performance when the battery can't deliver power. --
+# -- Battery health (laptops). A failing battery can't deliver peak power,
+#    and the machine pulls performance down to match (worst on Intel). --
 if pmset -g batt 2>/dev/null | grep -q InternalBattery; then
   BATT=$(system_profiler SPPowerDataType 2>/dev/null)
   B_CYCLES=$(printf '%s' "$BATT" | awk '/Cycle Count/{print $3; exit}')
@@ -596,7 +596,7 @@ fi
 
 # -- Thermal throttling.  CPU_Speed_Limit is an Intel/SMC field; it does NOT
 #    exist on Apple Silicon, so the old "print OK if absent" logic reported a
-#    false all-clear on every M-series Mac. Report honestly per platform;
+#    false all-clear on every M-series Mac. Report what each platform exposes;
 #    Apple Silicon gets a real sample in the admin section (powermetrics). --
 if [ "$PLATFORM" = "Intel" ]; then
   THERM=$(pmset -g therm 2>/dev/null | awk -F'= ' '/CPU_Speed_Limit/{print $2}')
@@ -606,7 +606,7 @@ if [ "$PLATFORM" = "Intel" ]; then
   else
     ok "Thermals OK (no CPU throttling)"
   fi
-  # FileVault on Intel (no T2) costs real disk I/O — worth knowing, not changing.
+  # FileVault on Intel (no T2) costs real disk I/O. Worth knowing about, not changing.
   if fdesetup status 2>/dev/null | grep -q 'On'; then
     note "FileVault is on — on Intel Macs this costs some disk speed (a fair security trade)"
   fi
@@ -641,7 +641,7 @@ fi
 CR_FILES=$( { find "$HOME/Library/Logs/DiagnosticReports" -name '*.ips' -mtime -7 2>/dev/null
               find /Library/Logs/DiagnosticReports -name '*.ips' -mtime -7 2>/dev/null; } )
 # grep -c prints a count even when it exits nonzero (zero matches), so take its
-# output as-is — appending a fallback would double the "0".
+# output as-is; appending a fallback would double the "0".
 CR_COUNT=$(printf '%s' "$CR_FILES" | grep -c . 2>/dev/null); CR_COUNT="${CR_COUNT:-0}"
 PANICS=$(printf '%s' "$CR_FILES" | grep -ci 'panic' 2>/dev/null); PANICS="${PANICS:-0}"
 JETSAMS=$(printf '%s' "$CR_FILES" | grep -ci 'jetsam' 2>/dev/null); JETSAMS="${JETSAMS:-0}"
@@ -681,7 +681,7 @@ fi
 echo
 
 # =============================================================================
-#  2. Safe maintenance  (no sudo, always reversible)
+#  2. Safe maintenance. No sudo needed and every change can be undone.
 # =============================================================================
 info "2/7  Safe maintenance"
 
@@ -721,9 +721,9 @@ run "flush DNS resolver cache" dscacheutil -flushcache >/dev/null 2>&1
 ok "DNS resolver cache flushed"
 
 # =============================================================================
-#  3. Developer caches  (opt-in; only offered when present AND big)
+#  3. Developer caches, opt-in, offered only when a tool is present and its cache is big.
 #     These trade disk for a slower next build, so they are NOT automatic.
-#     Each goes to Trash whole — recoverable until you empty the Trash, unlike
+#     Each goes to Trash whole, recoverable until you empty the Trash, unlike
 #     the tools' own one-way `clean` commands.
 # =============================================================================
 info "3/7  Developer caches (opt-in)"
@@ -749,7 +749,7 @@ fi
 [ "$dev_found" -eq 0 ] && skip "no large developer caches (or skipped)"
 
 # =============================================================================
-#  4. UI responsiveness  (opt-in; perceived speed, fully reversible)
+#  4. UI responsiveness (opt-in). This one is about perceived speed.
 #     Reduce Motion/Transparency measurably lowers WindowServer load on
 #     low-RAM and integrated-GPU Macs. Reversible in System Settings.
 # =============================================================================
@@ -760,7 +760,7 @@ if [ "$RT" = "1" ]; then
 else
   if confirm ui_reduce "Reduce transparency & motion? (lighter on GPU/WindowServer, reversible)"; then
     # Write BOTH the legacy universalaccess domain AND the modern Accessibility
-    # domain that Ventura+ System Settings actually reads — otherwise the toggle
+    # domain that Ventura+ System Settings actually reads; otherwise the toggle
     # in Settings won't reflect the change and the effect may not apply live.
     run "set reduceTransparency"  defaults write com.apple.universalaccess reduceTransparency -bool true
     run "set reduceMotion"        defaults write com.apple.universalaccess reduceMotion -bool true
@@ -778,7 +778,7 @@ else
 fi
 
 # =============================================================================
-#  5. System level  (sudo; each step gated and reversible)
+#  5. System level. Needs an admin password; every step asks first.
 # =============================================================================
 info "5/7  System level (needs admin password)"
 SUDO_OK=0
@@ -791,7 +791,7 @@ elif confirm admin_section "Run the admin section now? (you'll be asked for your
 fi
 
 if [ "$SUDO_OK" = "1" ]; then
-  # -- Apple Silicon thermal pressure: the honest reading section 1 promised.
+  # -- Apple Silicon thermal pressure, the reading section 1 deferred to here.
   #    powermetrics is read-only; one 1s sample. --
   if [ "$PLATFORM" = "Apple Silicon" ]; then
     TH=$(sudo powermetrics -n1 -i1 -s thermal 2>/dev/null | awk -F': *' '/[Pp]ressure [Ll]evel/{print $2; exit}')
@@ -820,7 +820,7 @@ if [ "$SUDO_OK" = "1" ]; then
   fi
 
   # -- purge ONLY under genuine memory pressure (otherwise it is placebo
-  #    that slows the next few minutes; per Oakley/Apple). Fresh reading —
+  #    that slows the next few minutes; per Oakley/Apple). Take a fresh reading;
   #    pressure may have changed since section 1. --
   if memory_pressure 2>/dev/null | grep -Eqi 'warning|critical'; then
     run "purge inactive memory" sudo purge >/dev/null 2>&1
@@ -830,7 +830,7 @@ if [ "$SUDO_OK" = "1" ]; then
   fi
 
   # -- Spotlight reindex ONLY when search is measurably slow (mds runaway).
-  #    Never blanket — a rebuild costs 1–2h of indexing. --
+  #    Never blanket; a rebuild costs 1-2h of indexing. --
   slow=0
   for _ in 1 2; do
     s=$(date +%s); mdfind "kMDItemFSName == 'Applications'" >/dev/null 2>&1; e=$(date +%s)
@@ -862,7 +862,7 @@ else
 fi
 
 # =============================================================================
-#  6. Platform-specific guidance  (no blind action — tells the truth per chip)
+#  6. Platform notes. Advice only; nothing runs in this section.
 # =============================================================================
 info "6/7  Platform notes"
 if [ "$PLATFORM" = "Apple Silicon" ]; then
@@ -878,7 +878,7 @@ fi
 echo
 
 # =============================================================================
-#  7. Health score  (every point traceable to a measurement above)
+#  7. Health score. Every deduction references a measurement from section 1.
 # =============================================================================
 info "7/7  Health score"
 [ "$SCORE" -lt 0 ] && SCORE=0
