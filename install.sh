@@ -54,7 +54,7 @@ trap 'rm -f "$TMP"' EXIT
 # FIX #2: Pin the expected SHA-256 of the latest release so the download
 # cannot be silently swapped out by a compromised CDN or DNS hijack.
 # Update this value whenever a new release is tagged.
-EXPECTED_SHA256="c5485f203b16909cd5d3afd374e28dae15f26b6b60ee4310a70f90cf72f1c1ff"
+EXPECTED_SHA256="413eadfea811a43bb35dc3fde08ec138b4bd8235ee4603401330f34d796a74eb"
 
 printf '» downloading mactune…\n'
 curl -fsSL "$RAW" -o "$TMP"
