@@ -22,7 +22,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --desktop) DESKTOP=1 ;;
     --prefix)
-      # FIX #9: Check that a value actually follows --prefix before shifting,
+      # Check that a value actually follows --prefix before shifting,
       # otherwise the outer shift runs with $#=0 and crashes under set -e.
       if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
         printf 'install.sh: --prefix requires a directory argument\n' >&2; exit 64
@@ -51,7 +51,7 @@ mkdir -p "$PREFIX"
 TMP=$(mktemp /tmp/mactune.XXXXXX)
 trap 'rm -f "$TMP"' EXIT
 
-# FIX #2: Pin the expected SHA-256 of the latest release so the download
+# Pin the expected SHA-256 of the latest release so the download
 # cannot be silently swapped out by a compromised CDN or DNS hijack.
 # Update this value whenever a new release is tagged.
 EXPECTED_SHA256="413eadfea811a43bb35dc3fde08ec138b4bd8235ee4603401330f34d796a74eb"

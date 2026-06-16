@@ -209,7 +209,7 @@ trap 'on_winch' WINCH
 
 # ---- dry-run-aware action wrapper -------------------------------------------
 # run "<human label>" cmd args...  runs the command unless DRY_RUN=1.
-# FIX #8: Capture exit code and emit a warning if the command fails,
+# Capture exit code and emit a warning if the command fails,
 # instead of silently returning 0 and printing a false checkmark.
 run() {
   local label="$1"; shift
@@ -234,7 +234,7 @@ prefs_set() {                          # prefs_set <key> <value>  (overwrites in
   mkdir -p "$(dirname "$PREFS")" 2>/dev/null || return 1
   touch "$PREFS" 2>/dev/null || return 1
   local tmp="$PREFS.tmp.$$"
-  # FIX #1: Use awk for a robust, regex-safe lookup and write instead of grep
+  # Use awk for a robust, regex-safe lookup and write instead of grep
   # to prevent duplicate settings while keeping key matching literal.
   # Also register a trap so the tmp file is cleaned up on interrupt.
   trap 'rm -f "$tmp"' INT TERM
@@ -315,7 +315,7 @@ trash_it() {
   [ -L "$p" ] && return 1   # never follow/move a symlink — no traversal surprises
   local base; base=$(basename "$p")
   local dest="$TRASH/$base"
-  # FIX #6: Use a timestamp suffix for O(1) uniqueness instead of an O(n)
+  # Use a timestamp suffix for O(1) uniqueness instead of an O(n)
   # counter loop that can freeze for seconds with thousands of same-named Trash items.
   if [ -e "$dest" ]; then
     dest="$TRASH/${base}.$(date +%s%N 2>/dev/null || date +%s)"
@@ -471,7 +471,7 @@ SWAP_USED=$(sysctl -n vm.swapusage 2>/dev/null | awk '{print $6}')
 [ -n "${SWAP_USED:-}" ] && note "Swap used: ${SWAP_USED} (occasional swap is normal; sustained = short on RAM)"
 # vm_stat exposes cumulative Swapins/Swapouts; a nonzero delta over ~1s = active
 # thrash right now, which is far more diagnostic than the static snapshot above.
-# FIX #5: vm_stat reports in pages (16 KB on Apple Silicon, 4 KB on Intel).
+# vm_stat reports in pages (16 KB on Apple Silicon, 4 KB on Intel).
 # Convert to KB for a human-readable warning and drop the misleading "per sec" label.
 _pagesize=$(vm_stat 2>/dev/null | awk '/page size of/{print $8}'); _pagesize=${_pagesize:-4096}
 si1=$(vm_stat 2>/dev/null | awk -F: '/Swapins/{gsub(/[ .]/,"",$2);print $2}')
@@ -586,7 +586,7 @@ if [ -n "$HOTSPOTS" ]; then
 fi
 
 # -- Disk hardware health: a dying disk is the slowness nobody checks for --
-# FIX #4: Iterate all physical whole-disks (diskN where N is a digit) instead
+# Iterate all physical whole-disks (diskN where N is a digit) instead
 # of hardcoding disk0, which is wrong on Fusion Drives and some APFS layouts.
 _smart_checked=0
 for _disk in $(diskutil list | awk '/^\/dev\/disk[0-9]+ \(/{gsub(/^\/dev\//,""); gsub(/ .*/,""); print}'); do
@@ -672,7 +672,7 @@ CR_FILES=$( { find "$HOME/Library/Logs/DiagnosticReports" -name '*.ips' -mtime -
 # grep -c prints a count even when it exits nonzero (zero matches), so take its
 # output as-is; appending a fallback would double the "0".
 CR_COUNT=$(printf '%s' "$CR_FILES" | grep -c . 2>/dev/null); CR_COUNT="${CR_COUNT:-0}"
-# FIX #7: Match panic/jetsam against FILE CONTENTS, not filenames.
+# Match panic/jetsam against FILE CONTENTS, not filenames.
 # Grepping the path list matched words in directory names or coincidental app names,
 # causing both false positives and false negatives.
 PANICS=0; JETSAMS=0
@@ -946,7 +946,7 @@ else
 fi
 
 # -- Trend vs the previous run (history survives across runs) --
-# FIX #3: Guard DELTA arithmetic — PREV_SCORE must be a plain integer before
+# Guard DELTA arithmetic — PREV_SCORE must be a plain integer before
 # we use it in $(( )) or it will crash the script under set -u on bad CSV data.
 if [ -f "$HIST" ]; then
   PREV_LINE=$(tail -1 "$HIST" 2>/dev/null)
