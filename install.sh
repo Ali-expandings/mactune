@@ -14,14 +14,20 @@
 # =============================================================================
 set -eu
 
-RAW="https://raw.githubusercontent.com/Ali-expandings/mactune/main/mactune"
+RAW="${MACTUNE_SOURCE_URL:-https://raw.githubusercontent.com/Ali-expandings/mactune/main/mactune}"
 DESKTOP=0
 PREFIX=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --desktop) DESKTOP=1 ;;
-    --prefix)  shift; PREFIX="${1:-}" ;;
+    --prefix)
+      # Check that a value actually follows --prefix before shifting,
+      # otherwise the outer shift runs with $#=0 and crashes under set -e.
+      if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+        printf 'install.sh: --prefix requires a directory argument\n' >&2; exit 64
+      fi
+      shift; PREFIX="$1" ;;
     *) printf 'install.sh: unknown option %s\n' "$1" >&2; exit 64 ;;
   esac
   shift
@@ -45,6 +51,11 @@ mkdir -p "$PREFIX"
 TMP=$(mktemp /tmp/mactune.XXXXXX)
 trap 'rm -f "$TMP"' EXIT
 
+# Pin the expected SHA-256 of the latest release so the download
+# cannot be silently swapped out by a compromised CDN or DNS hijack.
+# Update this value whenever a new release is tagged.
+EXPECTED_SHA256="c75af7153cf703927106bb9fb2652298d98381c91736fb0fd31fc58160596ee3"
+
 printf '» downloading mactune…\n'
 curl -fsSL "$RAW" -o "$TMP"
 
@@ -53,6 +64,20 @@ head -1 "$TMP" | grep -q '^#!/bin/bash' || {
   printf 'install.sh: download did not look like mactune — aborting.\n' >&2
   exit 1
 }
+
+# Integrity check: verify SHA-256 matches the pinned value.
+if command -v shasum >/dev/null 2>&1; then
+  ACTUAL_SHA256=$(shasum -a 256 "$TMP" | awk '{print $1}')
+  if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+    printf 'install.sh: SHA-256 mismatch — download may be tampered.\n' >&2
+    printf '  expected: %s\n' "$EXPECTED_SHA256" >&2
+    printf '  got:      %s\n' "$ACTUAL_SHA256" >&2
+    exit 1
+  fi
+  printf '✓ integrity verified (SHA-256 matches)\n'
+else
+  printf '▲ shasum not found — skipping integrity check\n' >&2
+fi
 
 install -m 0755 "$TMP" "$PREFIX/mactune"
 printf '✓ installed: %s/mactune\n' "$PREFIX"
