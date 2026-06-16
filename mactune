@@ -209,13 +209,20 @@ trap 'on_winch' WINCH
 
 # ---- dry-run-aware action wrapper -------------------------------------------
 # run "<human label>" cmd args...  runs the command unless DRY_RUN=1.
+# FIX #8: Capture exit code and emit a warning if the command fails,
+# instead of silently returning 0 and printing a false checkmark.
 run() {
   local label="$1"; shift
   if [ "$DRY_RUN" = "1" ]; then
     printf '  %s[dry-run]%s %s\n' "$C_WARN" "$C_RST" "$label"
     return 0
   fi
-  "$@"
+  local _rc=0
+  "$@" || _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    warn "command failed (exit $_rc): $label"
+  fi
+  return "$_rc"
 }
 
 # ---- saved-answers profile (mode 3): a tiny key=value store -----------------
@@ -227,9 +234,14 @@ prefs_set() {                          # prefs_set <key> <value>  (overwrites in
   mkdir -p "$(dirname "$PREFS")" 2>/dev/null || return 1
   touch "$PREFS" 2>/dev/null || return 1
   local tmp="$PREFS.tmp.$$"
-  grep -v "^$1=" "$PREFS" 2>/dev/null > "$tmp"
+  # FIX #1: Use awk for a robust, regex-safe lookup and write instead of grep
+  # to prevent duplicate settings while keeping key matching literal.
+  # Also register a trap so the tmp file is cleaned up on interrupt.
+  trap 'rm -f "$tmp"' INT TERM
+  awk -F= -v k="$1" '$1!=k' "$PREFS" 2>/dev/null > "$tmp"
   printf '%s=%s\n' "$1" "$2" >> "$tmp"
   mv "$tmp" "$PREFS"
+  trap - INT TERM
 }
 
 # ---- y/n prompt, default No.  Behaviour set by $ANSWERS ----------------------
@@ -303,8 +315,13 @@ trash_it() {
   [ -L "$p" ] && return 1   # never follow/move a symlink — no traversal surprises
   local base; base=$(basename "$p")
   local dest="$TRASH/$base"
-  local n=2
-  while [ -e "$dest" ]; do dest="$TRASH/${base}.$n"; n=$((n+1)); done
+  # FIX #6: Use a timestamp suffix for O(1) uniqueness instead of an O(n)
+  # counter loop that can freeze for seconds with thousands of same-named Trash items.
+  if [ -e "$dest" ]; then
+    dest="$TRASH/${base}.$(date +%s%N 2>/dev/null || date +%s)"
+    # Final fallback: if still collides (sub-second duplicates), add PID
+    [ -e "$dest" ] && dest="${dest}.$$"
+  fi
   run "move to Trash: $p" /bin/mv "$p" "$dest"
 }
 
@@ -452,17 +469,22 @@ fi
 # -- Swap: static usage AND live in/out rate (the thrash signal) --
 SWAP_USED=$(sysctl -n vm.swapusage 2>/dev/null | awk '{print $6}')
 [ -n "${SWAP_USED:-}" ] && note "Swap used: ${SWAP_USED} (occasional swap is normal; sustained = short on RAM)"
-# vm_stat exposes cumulative Swapins/Swapouts; a nonzero delta over 1s = active
+# vm_stat exposes cumulative Swapins/Swapouts; a nonzero delta over ~1s = active
 # thrash right now, which is far more diagnostic than the static snapshot above.
+# FIX #5: vm_stat reports in pages (16 KB on Apple Silicon, 4 KB on Intel).
+# Convert to KB for a human-readable warning and drop the misleading "per sec" label.
+_pagesize=$(vm_stat 2>/dev/null | awk '/page size of/{print $8}'); _pagesize=${_pagesize:-4096}
 si1=$(vm_stat 2>/dev/null | awk -F: '/Swapins/{gsub(/[ .]/,"",$2);print $2}')
 so1=$(vm_stat 2>/dev/null | awk -F: '/Swapouts/{gsub(/[ .]/,"",$2);print $2}')
 if [ -n "${si1:-}" ] && [ "$DRY_RUN" != "1" ]; then
-  spin 1 "Sampling memory pressure…"
+  spin 1 "Sampling swap activity…"
   si2=$(vm_stat 2>/dev/null | awk -F: '/Swapins/{gsub(/[ .]/,"",$2);print $2}')
   so2=$(vm_stat 2>/dev/null | awk -F: '/Swapouts/{gsub(/[ .]/,"",$2);print $2}')
   d_in=$(( ${si2:-0} - ${si1:-0} )); d_out=$(( ${so2:-0} - ${so1:-0} ))
   if [ "$d_in" -gt 0 ] || [ "$d_out" -gt 0 ]; then
-    warn "Active swapping NOW (+${d_in} in / +${d_out} out per sec) — RAM is the bottleneck"
+    _in_kb=$(( d_in  * _pagesize / 1024 ))
+    _out_kb=$(( d_out * _pagesize / 1024 ))
+    warn "Active swapping detected (+${_in_kb} KB in / +${_out_kb} KB out in ~1s) — RAM is the bottleneck"
     pen 15 "actively swapping to disk"
   fi
 fi
@@ -564,15 +586,22 @@ if [ -n "$HOTSPOTS" ]; then
 fi
 
 # -- Disk hardware health: a dying disk is the slowness nobody checks for --
-SMART=$(diskutil info disk0 2>/dev/null | awk -F': *' '/SMART Status/{print $2}')
-case "${SMART:-}" in
-  Verified) ok "Disk SMART status: Verified" ;;
-  "")       ;;  # external/virtual setups may not expose disk0 — stay silent
-  *[Ff]ail*)
-    warn "Disk SMART status: ${SMART} — BACK UP NOW and have the disk checked"
-    pen 40 "disk reports SMART ${SMART}" ;;
-  *)        note "Disk SMART status: ${SMART}" ;;
-esac
+# FIX #4: Iterate all physical whole-disks (diskN where N is a digit) instead
+# of hardcoding disk0, which is wrong on Fusion Drives and some APFS layouts.
+_smart_checked=0
+for _disk in $(diskutil list | awk '/^\/dev\/disk[0-9]+ \(/{gsub(/^\/dev\//,""); gsub(/ .*/,""); print}'); do
+  SMART=$(diskutil info "$_disk" 2>/dev/null | awk -F': *' '/SMART Status/{print $2}')
+  [ -z "${SMART:-}" ] && continue
+  _smart_checked=$((_smart_checked+1))
+  case "${SMART}" in
+    Verified) ok "Disk SMART status: Verified ($_disk)" ;;
+    *[Ff]ail*)
+      warn "Disk SMART status: ${SMART} on $_disk — BACK UP NOW and have the disk checked"
+      pen 40 "disk $_disk reports SMART ${SMART}" ;;
+    *)  note "Disk SMART status: ${SMART} ($_disk)" ;;
+  esac
+done
+[ "$_smart_checked" -eq 0 ] && : # no SMART-capable disks found — stay silent
 
 # -- Battery health (laptops). A failing battery can't deliver peak power,
 #    and the machine pulls performance down to match (worst on Intel). --
@@ -643,8 +672,20 @@ CR_FILES=$( { find "$HOME/Library/Logs/DiagnosticReports" -name '*.ips' -mtime -
 # grep -c prints a count even when it exits nonzero (zero matches), so take its
 # output as-is; appending a fallback would double the "0".
 CR_COUNT=$(printf '%s' "$CR_FILES" | grep -c . 2>/dev/null); CR_COUNT="${CR_COUNT:-0}"
-PANICS=$(printf '%s' "$CR_FILES" | grep -ci 'panic' 2>/dev/null); PANICS="${PANICS:-0}"
-JETSAMS=$(printf '%s' "$CR_FILES" | grep -ci 'jetsam' 2>/dev/null); JETSAMS="${JETSAMS:-0}"
+# FIX #7: Match panic/jetsam against FILE CONTENTS, not filenames.
+# Grepping the path list matched words in directory names or coincidental app names,
+# causing both false positives and false negatives.
+PANICS=0; JETSAMS=0
+if [ -n "$CR_FILES" ]; then
+  while IFS= read -r _f; do
+    [ -f "$_f" ] || continue
+    _head=$(head -5 "$_f" 2>/dev/null)
+    printf '%s' "$_head" | grep -qi 'kernel panic\|panic report' && PANICS=$((PANICS+1))
+    printf '%s' "$_head" | grep -qi 'jetsam'                     && JETSAMS=$((JETSAMS+1))
+  done <<EOF
+$CR_FILES
+EOF
+fi
 if [ "${PANICS:-0}" -gt 0 ]; then
   warn "Kernel panic report(s) in the last 7 days: ${PANICS} — hardware/driver issue; check Apple Diagnostics (boot holding D)"
   pen 15 "kernel panic this week"
@@ -675,7 +716,14 @@ fi
 #    settles the single most common misdiagnosis. ~20s, so always opt-in. --
 if [ "$DRY_RUN" != "1" ] && command -v networkQuality >/dev/null 2>&1; then
   if confirm net_test "Test network speed & responsiveness? (~20s — rules the internet in/out as the culprit)"; then
-    networkQuality 2>/dev/null || note "network test could not run (offline?)"
+    _net_out=$(networkQuality 2>/dev/null)
+    if [ -n "${_net_out:-}" ]; then
+      printf '%s\n' "$_net_out" | while read -r line; do
+        [ -n "$line" ] && note "  $line"
+      done
+    else
+      note "network test could not run (offline?)"
+    fi
   fi
 fi
 echo
@@ -702,8 +750,10 @@ if [ -d "$HOME/Library/LaunchAgents" ]; then
       *) continue ;;                             # bare name resolves via PATH
     esac
     if [ ! -e "$bin" ]; then
-      run "unload + trash broken agent: $(basename "$plist")" \
-        launchctl bootout "gui/$(id -u)/$(basename "${plist%.plist}")" 2>/dev/null
+      _svc="gui/$(id -u)/$(basename "${plist%.plist}")"
+      if launchctl print "$_svc" >/dev/null 2>&1; then
+        run "unload broken agent: $(basename "$plist")" launchctl bootout "$_svc" 2>/dev/null
+      fi
       trash_it "$plist" && { ok "broken login agent removed: $(basename "$plist")"; note "(its program was gone: $bin)"; broken=$((broken+1)); }
     fi
   done
@@ -896,9 +946,11 @@ else
 fi
 
 # -- Trend vs the previous run (history survives across runs) --
+# FIX #3: Guard DELTA arithmetic — PREV_SCORE must be a plain integer before
+# we use it in $(( )) or it will crash the script under set -u on bad CSV data.
 if [ -f "$HIST" ]; then
   PREV_LINE=$(tail -1 "$HIST" 2>/dev/null)
-  PREV_SCORE=$(printf '%s' "$PREV_LINE" | awk -F, 'NF>=2 && $2+0==$2 {print $2}')
+  PREV_SCORE=$(printf '%s' "$PREV_LINE" | awk -F, 'NF>=2 && $2~/^[0-9]+$/ {print $2}')
   PREV_DATE=$(printf '%s' "$PREV_LINE" | awk -F, '{print $1}')
   if [ -n "${PREV_SCORE:-}" ]; then
     DELTA=$(( SCORE - PREV_SCORE ))

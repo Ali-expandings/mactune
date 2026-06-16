@@ -17,6 +17,14 @@ jobs:
           bash -n mactune
           sh -n install.sh
 
+      # FIX #10: Add ShellCheck static analysis to catch regex-in-grep,
+      # unchecked return codes, unquoted variables, and similar issues
+      # that bash -n (syntax only) will never catch.
+      - name: shellcheck
+        run: |
+          brew install shellcheck 2>/dev/null || true
+          shellcheck -S warning -e SC1091,SC2310 mactune install.sh
+
       - name: flags
         run: |
           ./mactune --version
@@ -32,7 +40,36 @@ jobs:
       - name: rollback path
         run: MODE=rollback ./mactune </dev/null
 
+      # FIX #10: Test the saved-answers round-trip (prefs_get/prefs_set)
+      - name: saved-answers profile round-trip
+        run: |
+          ANSWERS=saved ./mactune --dry-run </dev/null
+          test -f "$HOME/.config/mactune/answers.conf" && echo "prefs file created OK"
+
+      # FIX #10: Test --reset clears the saved profile
+      - name: reset flag
+        run: |
+          RESET=1 ./mactune --dry-run </dev/null
+          if [ -f "$HOME/.config/mactune/answers.conf" ]; then
+            echo "ERROR: prefs file should have been cleared by --reset"; exit 1
+          fi
+
+      # FIX #10: Test history CSV is written and trend code runs on 2nd pass
+      - name: history trend (two runs)
+        run: |
+          ./mactune --no-sudo </dev/null
+          test -f "$HOME/.config/mactune/history.csv" && echo "history file created OK"
+          ./mactune --no-sudo </dev/null  # 2nd run triggers DELTA/trend path
+
       - name: installer (sandboxed prefix)
         run: |
-          sh install.sh --prefix "$RUNNER_TEMP/bin"
+          MACTUNE_SOURCE_URL="file://$(pwd)/mactune" sh install.sh --prefix "$RUNNER_TEMP/bin"
           "$RUNNER_TEMP/bin/mactune" --version
+
+      # FIX #10: Verify --prefix without argument exits with error (not crash)
+      - name: installer prefix-no-arg guard
+        run: |
+          if sh install.sh --prefix 2>/dev/null; then
+            echo "ERROR: should have exited with error"; exit 1
+          fi
+          echo "correctly rejected --prefix with no argument"
