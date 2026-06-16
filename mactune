@@ -236,12 +236,12 @@ prefs_set() {                          # prefs_set <key> <value>  (overwrites in
   local tmp="$PREFS.tmp.$$"
   # Use awk for a robust, regex-safe lookup and write instead of grep
   # to prevent duplicate settings while keeping key matching literal.
-  # Also register a trap so the tmp file is cleaned up on interrupt.
-  trap 'rm -f "$tmp"' INT TERM
+  # NOTE: no trap here — the global bar_teardown trap on INT/TERM must not
+  # be clobbered. A stale tmp file in ~/.config/mactune/ is harmless;
+  # the next run's mv will overwrite it.
   awk -F= -v k="$1" '$1!=k' "$PREFS" 2>/dev/null > "$tmp"
   printf '%s=%s\n' "$1" "$2" >> "$tmp"
   mv "$tmp" "$PREFS"
-  trap - INT TERM
 }
 
 # ---- y/n prompt, default No.  Behaviour set by $ANSWERS ----------------------
@@ -337,7 +337,9 @@ cache_offer() {
   [ "$kb" -gt "$min" ] || return 1
   dev_found=1
   if confirm "$key" "$label is $(human $(( kb * 1024 ))). Move it to Trash? (rebuilt on next use)"; then
-    if trash_it "$path"; then
+    if [ "$DRY_RUN" = "1" ]; then
+      trash_it "$path"        # prints [dry-run] label, moves nothing
+    elif trash_it "$path"; then
       RECLAIMED_KB=$(( RECLAIMED_KB + kb ))
       ok "$label → Trash ($(human $(( kb * 1024 ))) reclaimed)"
     fi
@@ -716,14 +718,15 @@ fi
 #    settles the single most common misdiagnosis. ~20s, so always opt-in. --
 if [ "$DRY_RUN" != "1" ] && command -v networkQuality >/dev/null 2>&1; then
   if confirm net_test "Test network speed & responsiveness? (~20s — rules the internet in/out as the culprit)"; then
-    _net_out=$(networkQuality 2>/dev/null)
-    if [ -n "${_net_out:-}" ]; then
-      printf '%s\n' "$_net_out" | while read -r line; do
-        [ -n "$line" ] && note "  $line"
-      done
-    else
-      note "network test could not run (offline?)"
-    fi
+    # Stream output live so the user sees progress during the ~20s test,
+    # instead of capturing into a variable (which freezes the terminal).
+    # The pipe keeps each line indented under note() for visual consistency.
+    # NOTE: the while loop runs in a subshell (bash pipe), so we cannot use
+    # a flag variable to detect output. Use PIPESTATUS[0] instead.
+    networkQuality 2>/dev/null | while IFS= read -r line; do
+      [ -n "$line" ] && note "  $line"
+    done
+    [ "${PIPESTATUS[0]}" -ne 0 ] && note "network test could not run (offline?)"
   fi
 fi
 echo
@@ -751,10 +754,18 @@ if [ -d "$HOME/Library/LaunchAgents" ]; then
     esac
     if [ ! -e "$bin" ]; then
       _svc="gui/$(id -u)/$(basename "${plist%.plist}")"
+      _unloaded=1
       if launchctl print "$_svc" >/dev/null 2>&1; then
-        run "unload broken agent: $(basename "$plist")" launchctl bootout "$_svc" 2>/dev/null
+        run "unload broken agent: $(basename "$plist")" launchctl bootout "$_svc" 2>/dev/null || _unloaded=0
       fi
-      trash_it "$plist" && { ok "broken login agent removed: $(basename "$plist")"; note "(its program was gone: $bin)"; broken=$((broken+1)); }
+      # Only trash the plist if the agent was successfully unloaded (or was
+      # not loaded at all). Trashing a plist whose agent is still live would
+      # leave launchd referencing a missing file on next boot.
+      if [ "$_unloaded" = "1" ]; then
+        trash_it "$plist" && { ok "broken login agent removed: $(basename "$plist")"; note "(its program was gone: $bin)"; broken=$((broken+1)); }
+      else
+        warn "could not unload $(basename "$plist") — leaving plist in place"
+      fi
     fi
   done
 fi
@@ -818,8 +829,10 @@ else
     run "speed window resize"     defaults write -g NSWindowResizeTime -float 0.001
     run "disable window anims"    defaults write NSGlobalDomain NSAutomaticWindowAnimationsEnabled -bool false
     # Restart Dock/Finder to pick up changes (race-free); avoid killing cfprefsd.
-    run "restart Dock"            killall Dock 2>/dev/null
-    run "restart Finder"          killall Finder 2>/dev/null
+    # killall exits 1 when the process isn't running (harmless); suppress
+    # that so run() doesn't emit a false "command failed" warning.
+    run "restart Dock"            sh -c 'killall Dock 2>/dev/null || true'
+    run "restart Finder"          sh -c 'killall Finder 2>/dev/null || true'
     ok "UI set to performance mode (undo: System Settings → Accessibility → Display & Motion)"
     note "(log out / back in for full effect on WindowServer)"
   else
