@@ -32,7 +32,29 @@ jobs:
       - name: rollback path
         run: MODE=rollback ./mactune </dev/null
 
+      - name: dry run changes nothing and claims nothing
+        run: |
+          out=$(./mactune --dry-run --no-sudo </dev/null)
+          if printf '%s' "$out" | grep -q 'reclaimed'; then echo "dry run claimed reclaimed space"; exit 1; fi
+
+      - name: history trend (second run reads the first)
+        run: |
+          ./mactune --no-sudo </dev/null >/dev/null
+          test -f "$HOME/.config/mactune/history.csv"
+          out=$(./mactune --no-sudo </dev/null)   # capture first: grep -q on a pipe can SIGPIPE mactune under pipefail
+          printf '%s' "$out" | grep -q 'trend:'
+
+      - name: reset flag clears saved answers
+        run: |
+          mkdir -p "$HOME/.config/mactune" && echo '__mode__=saved' > "$HOME/.config/mactune/answers.conf"
+          RESET=1 ./mactune --dry-run </dev/null >/dev/null
+          test ! -f "$HOME/.config/mactune/answers.conf"
+
       - name: installer (sandboxed prefix)
         run: |
           sh install.sh --prefix "$RUNNER_TEMP/bin"
           "$RUNNER_TEMP/bin/mactune" --version
+
+      - name: installer rejects a bare --prefix
+        run: |
+          if sh install.sh --prefix 2>/dev/null; then echo "should have failed"; exit 1; fi

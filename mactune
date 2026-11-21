@@ -14,8 +14,9 @@
 #    Howard Oakley / Eclectic Light, and study of tw93/mole.
 #
 #  File removals are routed to Trash (recoverable). A few actions are one-way
-#  by nature and are NOT reversible: brew cleanup, `purge`, and a Spotlight
-#  reindex. Those get rebuilt by the system, never your data, and each
+#  by nature and are NOT reversible: brew cleanup, `purge`, a Spotlight
+#  reindex, and the LaunchServices cleanup (it forgets apps that no longer
+#  exist). Those get rebuilt by the system, never your data, and each
 #  is opt-in. Everything mutating is gated behind a prompt or a measured
 #  threshold.
 #
@@ -27,7 +28,7 @@
 set -u
 export LC_ALL=C
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 DRY_RUN="${DRY_RUN:-0}"
 NO_SUDO="${NO_SUDO:-0}"
@@ -209,14 +210,21 @@ trap 'on_winch' WINCH
 
 # ---- dry-run-aware action wrapper -------------------------------------------
 # run "<human label>" cmd args...  runs the command unless DRY_RUN=1.
+# A failing command is reported instead of being followed by a false ✓.
 run() {
   local label="$1"; shift
   if [ "$DRY_RUN" = "1" ]; then
     printf '  %s[dry-run]%s %s\n' "$C_WARN" "$C_RST" "$label"
     return 0
   fi
-  "$@"
+  local rc=0
+  "$@" || rc=$?
+  [ "$rc" -ne 0 ] && warn "command failed (exit $rc): $label"
+  return "$rc"
 }
+# done_ok "<message>": the ✓ that follows a run. In a dry run nothing happened,
+# so print nothing; run() already showed the [dry-run] line.
+done_ok() { [ "$DRY_RUN" = "1" ] || ok "$1"; }
 
 # ---- saved-answers profile (mode 3): a tiny key=value store -----------------
 prefs_get() {                          # prefs_get <key> -> echoes y|n, exit 1 if absent
@@ -227,7 +235,8 @@ prefs_set() {                          # prefs_set <key> <value>  (overwrites in
   mkdir -p "$(dirname "$PREFS")" 2>/dev/null || return 1
   touch "$PREFS" 2>/dev/null || return 1
   local tmp="$PREFS.tmp.$$"
-  grep -v "^$1=" "$PREFS" 2>/dev/null > "$tmp"
+  # awk compares the key literally; grep "^$1=" treated it as a regex.
+  awk -F= -v k="$1" '$1!=k' "$PREFS" 2>/dev/null > "$tmp"
   printf '%s=%s\n' "$1" "$2" >> "$tmp"
   mv "$tmp" "$PREFS"
 }
@@ -320,7 +329,9 @@ cache_offer() {
   [ "$kb" -gt "$min" ] || return 1
   dev_found=1
   if confirm "$key" "$label is $(human $(( kb * 1024 ))). Move it to Trash? (rebuilt on next use)"; then
-    if trash_it "$path"; then
+    if [ "$DRY_RUN" = "1" ]; then
+      trash_it "$path"          # prints the [dry-run] line, moves nothing, reclaims nothing
+    elif trash_it "$path"; then
       RECLAIMED_KB=$(( RECLAIMED_KB + kb ))
       ok "$label → Trash ($(human $(( kb * 1024 ))) reclaimed)"
     fi
@@ -452,18 +463,26 @@ fi
 # -- Swap: static usage AND live in/out rate (the thrash signal) --
 SWAP_USED=$(sysctl -n vm.swapusage 2>/dev/null | awk '{print $6}')
 [ -n "${SWAP_USED:-}" ] && note "Swap used: ${SWAP_USED} (occasional swap is normal; sustained = short on RAM)"
-# vm_stat exposes cumulative Swapins/Swapouts; a nonzero delta over 1s = active
+# vm_stat exposes cumulative Swapins/Swapouts; a nonzero delta over ~1s = active
 # thrash right now, which is far more diagnostic than the static snapshot above.
-si1=$(vm_stat 2>/dev/null | awk -F: '/Swapins/{gsub(/[ .]/,"",$2);print $2}')
-so1=$(vm_stat 2>/dev/null | awk -F: '/Swapouts/{gsub(/[ .]/,"",$2);print $2}')
+# vm_stat counts pages (16 KB on Apple Silicon, 4 KB on Intel); report KB.
+# The same sample also reads the memory compressor: macOS compresses RAM before
+# it swaps, so a compressor churning tens of thousands of pages a second means
+# RAM is being juggled even when swap looks quiet.
+vm_field() { vm_stat 2>/dev/null | awk -F: -v k="$1" '$1==k{gsub(/[ .]/,"",$2);print $2}'; }
+PAGE_SZ=$(vm_stat 2>/dev/null | awk '/page size of/{print $8}'); PAGE_SZ=${PAGE_SZ:-4096}
+si1=$(vm_field Swapins); so1=$(vm_field Swapouts); co1=$(vm_field Compressions)
 if [ -n "${si1:-}" ] && [ "$DRY_RUN" != "1" ]; then
-  spin 1 "Sampling memory pressure…"
-  si2=$(vm_stat 2>/dev/null | awk -F: '/Swapins/{gsub(/[ .]/,"",$2);print $2}')
-  so2=$(vm_stat 2>/dev/null | awk -F: '/Swapouts/{gsub(/[ .]/,"",$2);print $2}')
+  spin 1 "Sampling swap & compressor activity…"
+  si2=$(vm_field Swapins); so2=$(vm_field Swapouts); co2=$(vm_field Compressions)
   d_in=$(( ${si2:-0} - ${si1:-0} )); d_out=$(( ${so2:-0} - ${so1:-0} ))
   if [ "$d_in" -gt 0 ] || [ "$d_out" -gt 0 ]; then
-    warn "Active swapping NOW (+${d_in} in / +${d_out} out per sec) — RAM is the bottleneck"
+    warn "Active swapping NOW (+$(( d_in * PAGE_SZ / 1024 )) KB in / +$(( d_out * PAGE_SZ / 1024 )) KB out in ~1s) — RAM is the bottleneck"
     pen 15 "actively swapping to disk"
+  fi
+  d_co=$(( ${co2:-0} - ${co1:-0} ))
+  if [ "${d_co:-0}" -ge 5000 ]; then
+    note "Memory compressor busy: ${d_co} pages compressed in ~1s ($(human $(( d_co * PAGE_SZ ))) of RAM squeezed) — close something heavy"
   fi
 fi
 
@@ -564,18 +583,28 @@ if [ -n "$HOTSPOTS" ]; then
 fi
 
 # -- Disk hardware health: a dying disk is the slowness nobody checks for --
-SMART=$(diskutil info disk0 2>/dev/null | awk -F': *' '/SMART Status/{print $2}')
-case "${SMART:-}" in
-  Verified) ok "Disk SMART status: Verified" ;;
-  "")       ;;  # external/virtual setups may not expose disk0 — stay silent
-  *[Ff]ail*)
-    warn "Disk SMART status: ${SMART} — BACK UP NOW and have the disk checked"
-    pen 40 "disk reports SMART ${SMART}" ;;
-  *)        note "Disk SMART status: ${SMART}" ;;
-esac
+# Every PHYSICAL disk, not just disk0 (Fusion Drives and second internal disks
+# exist). Synthesized APFS containers and disk images are skipped: they mirror
+# a physical disk's status and would print it twice. USB enclosures usually
+# answer "Not Supported", which says nothing about the disk, so stay quiet.
+for SM_DISK in $(diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]+ \(.*physical/{sub(/^\/dev\//,"",$1); print $1}'); do
+  SMART=$(diskutil info "$SM_DISK" 2>/dev/null | awk -F': *' '/SMART Status/{print $2}')
+  SM_TAG=""; [ "$SM_DISK" = "disk0" ] || SM_TAG=" ($SM_DISK)"
+  case "${SMART:-}" in
+    Verified) ok "Disk SMART status: Verified${SM_TAG}" ;;
+    ""|"Not Supported") ;;
+    *[Ff]ail*)
+      warn "Disk SMART status: ${SMART}${SM_TAG} — BACK UP NOW and have the disk checked"
+      pen 40 "disk reports SMART ${SMART}" ;;
+    *)        note "Disk SMART status: ${SMART}${SM_TAG}" ;;
+  esac
+done
 
-# -- Battery health (laptops). A failing battery can't deliver peak power,
-#    and the machine pulls performance down to match (worst on Intel). --
+# -- Battery health (laptops). A FAILING battery (condition not Normal) can't
+#    deliver peak power, and the machine pulls performance down to match
+#    (worst on Intel). A battery that is merely old still delivers full power;
+#    it just holds less charge. v2.0 blurred the two; a reader rightly called
+#    it out, so the wording now follows the condition, not the age. --
 if pmset -g batt 2>/dev/null | grep -q InternalBattery; then
   BATT=$(system_profiler SPPowerDataType 2>/dev/null)
   B_CYCLES=$(printf '%s' "$BATT" | awk '/Cycle Count/{print $3; exit}')
@@ -583,10 +612,10 @@ if pmset -g batt 2>/dev/null | grep -q InternalBattery; then
   B_CAP=$(printf '%s' "$BATT"   | awk '/Maximum Capacity/{gsub(/%/,"",$3); print $3; exit}')
   if [ -n "${B_CAP:-}" ]; then
     if [ "${B_COND:-Normal}" != "Normal" ]; then
-      warn "Battery: ${B_CAP}% capacity, ${B_CYCLES:-?} cycles, condition '${B_COND}' — service recommended"
+      warn "Battery: ${B_CAP}% capacity, ${B_CYCLES:-?} cycles, condition '${B_COND}' — failing: it may not deliver peak power, so performance can be limited; service recommended"
       pen 10 "battery condition: ${B_COND}"
     elif [ "${B_CAP:-100}" -lt 80 ]; then
-      warn "Battery: ${B_CAP}% of original capacity (${B_CYCLES:-?} cycles) — aging; macOS may cap peak power"
+      warn "Battery: ${B_CAP}% of original capacity (${B_CYCLES:-?} cycles) — worn: shorter runtime per charge; condition is Normal, so it still delivers full power"
       pen 5 "battery at ${B_CAP}% capacity"
     else
       ok "Battery: ${B_CAP}% capacity, ${B_CYCLES:-?} cycles, condition ${B_COND:-Normal}"
@@ -627,7 +656,9 @@ if [ -n "${LI_LIST:-}" ]; then
 else
   ok "Login items: none"
 fi
-AGENTS=$(launchctl list 2>/dev/null | awk 'NR>1 && $3 !~ /^com\.apple\./{n++} END{print n+0}')
+# launchctl also lists every open app as "application.<bundle id>…"; those are
+# apps you are using, not background services, so they don't count here.
+AGENTS=$(launchctl list 2>/dev/null | awk 'NR>1 && $3 !~ /^com\.apple\./ && $3 !~ /^application\./{n++} END{print n+0}')
 if [ "${AGENTS:-0}" -ge 12 ]; then
   warn "Third-party background services: ${AGENTS} running — audit them (System Settings → General → Login Items)"
   pen 5 "${AGENTS} third-party background services"
@@ -638,37 +669,145 @@ fi
 # -- Stability: crash & panic reports from the last 7 days. A chronically
 #    crashing app burns CPU respawning; a kernel panic is a hardware/driver
 #    red flag that no cache cleanup will ever fix. --
-CR_FILES=$( { find "$HOME/Library/Logs/DiagnosticReports" -name '*.ips' -mtime -7 2>/dev/null
-              find /Library/Logs/DiagnosticReports -name '*.ips' -mtime -7 2>/dev/null; } )
+#    Kernel panics can be written as .panic files, so both extensions are read.
+CR_ALL=$( { find "$HOME/Library/Logs/DiagnosticReports" \( -name '*.ips' -o -name '*.panic' \) -mtime -7 2>/dev/null
+            find /Library/Logs/DiagnosticReports \( -name '*.ips' -o -name '*.panic' \) -mtime -7 2>/dev/null; } )
+# Not every report is a crash. JetsamEvent = a memory kill (counted on its own
+# below); ExcUserFault_ / ExcResource_ = non-fatal fault and resource reports
+# where the process kept running. v2.0 counted all of them as crashes.
+CR_FILES=$(printf '%s\n' "$CR_ALL" | grep -v -E '/(JetsamEvent-|ExcUserFault_|ExcResource_)[^/]*$' | grep . 2>/dev/null)
+JETSAM_FILES=$(printf '%s\n' "$CR_ALL" | grep -E '/JetsamEvent-[^/]*$' 2>/dev/null)
 # grep -c prints a count even when it exits nonzero (zero matches), so take its
 # output as-is; appending a fallback would double the "0".
 CR_COUNT=$(printf '%s' "$CR_FILES" | grep -c . 2>/dev/null); CR_COUNT="${CR_COUNT:-0}"
-PANICS=$(printf '%s' "$CR_FILES" | grep -ci 'panic' 2>/dev/null); PANICS="${PANICS:-0}"
-JETSAMS=$(printf '%s' "$CR_FILES" | grep -ci 'jetsam' 2>/dev/null); JETSAMS="${JETSAMS:-0}"
+PANICS=$(printf '%s\n' "$CR_FILES" | sed 's/.*\///' | grep -ci 'panic' 2>/dev/null); PANICS="${PANICS:-0}"
+JETSAMS=$(printf '%s' "$JETSAM_FILES" | grep -c . 2>/dev/null); JETSAMS="${JETSAMS:-0}"
 if [ "${PANICS:-0}" -gt 0 ]; then
   warn "Kernel panic report(s) in the last 7 days: ${PANICS} — hardware/driver issue; check Apple Diagnostics (boot holding D)"
   pen 15 "kernel panic this week"
 fi
+JETSAM_TOP=""
 if [ "${JETSAMS:-0}" -gt 0 ]; then
   warn "Jetsam event(s) this week: ${JETSAMS} — macOS force-killed processes to free memory; RAM ran out"
   pen 5 "system killed processes for memory"
+  # Each JetsamEvent report names the biggest memory user at that moment. Line 1
+  # is a JSON header and the rest is JSON, which plutil reads from stdin
+  # (macOS 12+; on 11 the name is simply not shown). Newest 3 reports.
+  while IFS= read -r jf; do
+    [ -r "$jf" ] || continue
+    j_body=$(tail -n +2 "$jf" 2>/dev/null)
+    j_who=$(printf '%s' "$j_body" | plutil -extract largestProcess raw -o - - 2>/dev/null)
+    j_when=$(printf '%s' "$j_body" | plutil -extract date raw -o - - 2>/dev/null); j_when="${j_when%%.*}"
+    if [ -n "$j_who" ]; then
+      note "${j_when:-date unknown}: biggest memory user when RAM ran out — ${j_who}"
+      [ -z "$JETSAM_TOP" ] && JETSAM_TOP="$j_who"
+    fi
+  done <<EOF
+$(printf '%s\n' "$JETSAM_FILES" | awk -F/ 'NF{print $NF"\t"$0}' | sort -r | cut -f2- | head -3)
+EOF
 fi
-TOP_CRASHER=""
+TOP_CRASHER=""; TOP_IS_APPLE=0
 if [ "${CR_COUNT:-0}" -gt 5 ]; then
   TOP_CRASHER=$(printf '%s\n' "$CR_FILES" | sed 's/.*\///; s/[-_][0-9].*//' | sort | uniq -c | sort -rn | head -1 | awk '{$1="";sub(/^ /,"");print}')
   CRASHER_N=$(printf '%s\n' "$CR_FILES" | sed 's/.*\///; s/[-_][0-9].*//' | sort | uniq -c | sort -rn | head -1 | awk '{print $1}')
-  case "$TOP_CRASHER" in
-    com.apple.*)
-      warn "Crash reports this week: ${CR_COUNT} (most frequent: ${TOP_CRASHER} ×${CRASHER_N} — a macOS component)"
-      note "an Apple service crashing repeatedly usually clears with a restart; if not, it's an OS/hardware issue — no cache cleanup will fix it" ;;
-    *)
-      warn "Crash reports this week: ${CR_COUNT} (most frequent: ${TOP_CRASHER} ×${CRASHER_N}) — update or reinstall it" ;;
-  esac
+  # Apple's own processes aren't all named com.apple.* (oahd-helper is Rosetta,
+  # lsd is LaunchServices), and "reinstall it" is wrong advice for those. The
+  # report's procPath says where the binary lives: system locations = Apple.
+  case "$TOP_CRASHER" in com.apple.*) TOP_IS_APPLE=1 ;; esac
+  if [ "$TOP_IS_APPLE" = "0" ]; then
+    tc_file=$(printf '%s\n' "$CR_FILES" | grep -F "/${TOP_CRASHER}" | head -1)
+    tc_path=$(grep -m1 '"procPath"' "$tc_file" 2>/dev/null | sed 's/.*"procPath" *: *"//; s/".*//; s/\\\//\//g')
+    case "$tc_path" in
+      /System/*|/usr/libexec/*|/usr/sbin/*|/usr/bin/*|/sbin/*|/bin/*|/Library/Apple/*) TOP_IS_APPLE=1 ;;
+    esac
+  fi
+  if [ "$TOP_IS_APPLE" = "1" ]; then
+    warn "Crash reports this week: ${CR_COUNT} (most frequent: ${TOP_CRASHER} ×${CRASHER_N} — a macOS component)"
+    note "an Apple component crashing repeatedly usually clears with a restart (or once a macOS update settles); if not, it's an OS/hardware issue — no cache cleanup will fix it"
+  else
+    warn "Crash reports this week: ${CR_COUNT} (most frequent: ${TOP_CRASHER} ×${CRASHER_N}) — update or reinstall it"
+  fi
   pen 5 "${CR_COUNT} crash reports this week"
 elif [ "${CR_COUNT:-0}" -gt 0 ]; then
   note "Crash reports this week: ${CR_COUNT} (occasional crashes are normal)"
 else
   ok "No crash reports in the last 7 days"
+fi
+
+# -- macOS's own resource-limit reports (last 7 days). When a process blows
+#    through its CPU or disk-write budget, macOS writes a .diag report naming
+#    it: the system's own record of what hogged this Mac. Read-only, newest
+#    first, no score penalty (they explain slowness; they aren't damage).
+#    Reading /Library/Logs/DiagnosticReports needs an admin account; for other
+#    users this stays silent. --
+RL_SORTED=$( { find "$HOME/Library/Logs/DiagnosticReports" -name '*.diag' -mtime -7 2>/dev/null
+               find /Library/Logs/DiagnosticReports -name '*.diag' -mtime -7 2>/dev/null; } \
+  | while IFS= read -r rf; do [ -r "$rf" ] && printf '%s\t%s\n' "$(stat -f %m "$rf" 2>/dev/null)" "$rf"; done \
+  | sort -rn | cut -f2- )
+RL_N=$(printf '%s' "$RL_SORTED" | grep -c . 2>/dev/null); RL_N="${RL_N:-0}"
+RL_STORAGE=0
+if [ "$RL_N" -gt 0 ]; then
+  note "macOS flagged ${RL_N} resource hog(s) this week (its own reports, newest first):"
+  rl_shown=0
+  while IFS= read -r rf; do
+    [ -n "$rf" ] || continue
+    [ "$rl_shown" -ge 5 ] && break
+    rl_cmd=$(sed -n 's/^Command: *//p' "$rf" | head -1)
+    rl_path=$(sed -n 's/^Path: *//p' "$rf" | head -1)
+    rl_cpu=$(sed -n 's/^CPU: .*(\([0-9]*\)% cpu average).*/\1/p' "$rf" | head -1)
+    rl_mb=$(sed -n 's/^Writes: *\([0-9.]*\) MB.*/\1/p' "$rf" | head -1)
+    rl_wk=$(sed -n 's/^Wakeups: *\([0-9]*\) wakeups.*/\1/p' "$rf" | head -1)
+    rl_sec=$(sed -n -e 's/^CPU: .* cpu time over \([0-9]*\) seconds.*/\1/p' \
+                    -e 's/^Writes: .* dirtied over \([0-9]*\) seconds.*/\1/p' \
+                    -e 's/^Wakeups: .* over the last \([0-9]*\) seconds.*/\1/p' "$rf" | head -1)
+    if   [ -n "$rl_cpu" ]; then rl_what="${rl_cpu}% CPU for $(awk -v s="${rl_sec:-0}" 'BEGIN{printf (s>=120)?"%d min":"%d s", (s>=120)?s/60:s}')"
+    elif [ -n "$rl_mb" ];  then rl_what="wrote $(awk -v m="$rl_mb" 'BEGIN{printf (m>=1024)?"%.1f GB":"%d MB", (m>=1024)?m/1024:m}') to disk in $(awk -v s="${rl_sec:-0}" 'BEGIN{printf (s>=7200)?"%.1f h":"%d min", (s>=7200)?s/3600:s/60}')"
+    elif [ -n "$rl_wk" ];  then rl_what="${rl_wk} CPU wakeups in ${rl_sec:-?} s"
+    else rl_what=$(sed -n 's/^Event: *//p' "$rf" | head -1); fi
+    rl_tag=""
+    case "$rl_cmd" in com.apple.*) rl_tag=" (macOS component)" ;; esac
+    case "$rl_path" in /System/*|/usr/libexec/*|/usr/sbin/*|/usr/bin/*|/Library/Apple/*) rl_tag=" (macOS component)" ;; esac
+    [ "$rl_cmd" = "StorageManagementService" ] && RL_STORAGE=1
+    printf '      %s — %s%s\n' "${rl_cmd:-unknown}" "$rl_what" "$rl_tag"
+    rl_shown=$(( rl_shown + 1 ))
+  done <<EOF
+$RL_SORTED
+EOF
+  [ "$RL_N" -gt 5 ] && note "  …and $(( RL_N - 5 )) more in /Library/Logs/DiagnosticReports"
+  [ "$RL_STORAGE" = "1" ] && note "  StorageManagementService runs while System Settings › General › Storage is open — close that pane when done"
+fi
+
+# -- LaunchServices app database: macOS's registry of every app it has seen.
+#    In-place app updates (browsers, Electron apps), deleted installers and old
+#    build folders leave dead entries behind, and every new registration
+#    rewrites the whole database, so a bloated one becomes constant disk
+#    writes by "lsd". (Found on the author's 8 GB Air: 1,110 of 2,422 entries
+#    dead; lsd wrote 2.1 GB in 83 minutes.) lsregister ships with every macOS;
+#    -dump only reads. Paths on /Volumes are skipped: an unplugged drive is
+#    not a dead app. The cleanup itself is offered, opt-in, in step 2. --
+LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+LS_TOTAL=0; LS_STALE=0; LS_STALE_LIST=""; LS_BLOATED=0
+if [ -x "$LSREG" ]; then
+  [ -t 1 ] && printf '   %s…%s  %sreading the app database%s\r' "$C_ACCENT" "$C_RST" "$C_DIM" "$C_RST"
+  while IFS= read -r lp; do
+    [ -n "$lp" ] || continue
+    LS_TOTAL=$(( LS_TOTAL + 1 ))
+    case "$lp" in /Volumes/*) continue ;; esac
+    if [ ! -e "$lp" ]; then
+      LS_STALE=$(( LS_STALE + 1 ))
+      LS_STALE_LIST="${LS_STALE_LIST}${lp}
+"
+    fi
+  done <<EOF
+$("$LSREG" -dump 2>/dev/null | sed -n 's/^path: *//p' | sed 's/ (0x[0-9a-f]*)$//' | sort -u)
+EOF
+  [ -t 1 ] && printf '\r\033[K'
+  if [ "$LS_STALE" -ge 300 ] || { [ "$LS_STALE" -ge 100 ] && [ $(( LS_STALE * 4 )) -ge "$LS_TOTAL" ]; }; then
+    LS_BLOATED=1
+    warn "App database: ${LS_STALE} of ${LS_TOTAL} registrations point to apps that no longer exist — bloat makes macOS rewrite it constantly (cleanup offered in step 2)"
+  elif [ "$LS_TOTAL" -gt 0 ]; then
+    ok "App database: ${LS_TOTAL} registrations, ${LS_STALE} stale"
+  fi
 fi
 
 # -- Optional: is it the Mac, or the internet? networkQuality (macOS 12+)
@@ -702,23 +841,59 @@ if [ -d "$HOME/Library/LaunchAgents" ]; then
       *) continue ;;                             # bare name resolves via PATH
     esac
     if [ ! -e "$bin" ]; then
-      run "unload + trash broken agent: $(basename "$plist")" \
-        launchctl bootout "gui/$(id -u)/$(basename "${plist%.plist}")" 2>/dev/null
-      trash_it "$plist" && { ok "broken login agent removed: $(basename "$plist")"; note "(its program was gone: $bin)"; broken=$((broken+1)); }
+      # Unload first if launchd has it loaded; trash the plist only when that
+      # worked (or it wasn't loaded), never leave launchd pointing at a moved
+      # file. (Contributed by @yyouretoast, PR #2.)
+      svc="gui/$(id -u)/$(basename "${plist%.plist}")"; unloaded=1
+      if launchctl print "$svc" >/dev/null 2>&1; then
+        run "unload broken agent: $(basename "$plist")" launchctl bootout "$svc" 2>/dev/null || unloaded=0
+      fi
+      if [ "$unloaded" = "1" ]; then
+        trash_it "$plist" && { done_ok "broken login agent removed: $(basename "$plist")"; note "(its program was gone: $bin)"; broken=$((broken+1)); }
+      else
+        warn "could not unload $(basename "$plist") — left in place"
+      fi
     fi
   done
 fi
 [ "$broken" -eq 0 ] && skip "no broken login agents"
 
 # -- QuickLook thumbnail + icon cache refresh (auto-rebuilt) --
-run "rebuild QuickLook cache" qlmanage -r cache >/dev/null 2>&1
+run "rebuild QuickLook cache" sh -c 'qlmanage -r cache >/dev/null 2>&1'
 ql="$HOME/Library/Caches/com.apple.QuickLook.thumbnailcache"
 [ -d "$ql" ] && trash_it "$ql" >/dev/null 2>&1
-ok "QuickLook thumbnail cache refreshed"
+done_ok "QuickLook thumbnail cache refreshed"
 
 # -- DNS resolver cache (fixes stale-DNS connectivity, harmless, no sudo) --
-run "flush DNS resolver cache" dscacheutil -flushcache >/dev/null 2>&1
-ok "DNS resolver cache flushed"
+run "flush DNS resolver cache" sh -c 'dscacheutil -flushcache >/dev/null 2>&1'
+done_ok "DNS resolver cache flushed"
+
+# -- LaunchServices cleanup (opt-in, one-way). Only when step 1 measured real
+#    bloat. Unregisters entries whose app no longer exists (each path is
+#    re-checked right before), then compacts the database. Installed apps and
+#    default-app choices (stored separately) are untouched; there is nothing to
+#    restore, because every removed entry pointed at a deleted app. --
+LS_REMOVED=0
+ls_cleanup() {
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ -e "$p" ] && continue
+    "$LSREG" -u "$p" >/dev/null 2>&1 && LS_REMOVED=$(( LS_REMOVED + 1 ))
+  done <<EOF
+$LS_STALE_LIST
+EOF
+  "$LSREG" -gc >/dev/null 2>&1
+  return 0
+}
+if [ "$LS_BLOATED" = "1" ]; then
+  if confirm ls_cleanup "Remove ${LS_STALE} dead entries from the app database and compact it? (one-way; only apps that no longer exist)"; then
+    run "unregister ${LS_STALE} dead app entries, then compact the database" ls_cleanup
+    done_ok "App database cleaned: ${LS_REMOVED} dead entries removed"
+  else
+    skip "app database cleanup declined"
+  fi
+fi
 
 # =============================================================================
 #  3. Developer caches, opt-in, offered only when a tool is present and its cache is big.
@@ -739,11 +914,11 @@ if command -v brew >/dev/null 2>&1; then
     dev_found=1
     BREW_CACHE_DIR=$(brew --cache 2>/dev/null)
     bkb1=0; [ -n "${BREW_CACHE_DIR:-}" ] && bkb1=$(du -sk "$BREW_CACHE_DIR" 2>/dev/null | cut -f1)
-    run "brew cleanup --prune=all" brew cleanup --prune=all >/dev/null 2>&1
+    run "brew cleanup --prune=all" sh -c 'brew cleanup --prune=all >/dev/null 2>&1'
     bkb2=0; [ -n "${BREW_CACHE_DIR:-}" ] && bkb2=$(du -sk "$BREW_CACHE_DIR" 2>/dev/null | cut -f1)
     bdiff=$(( ${bkb1:-0} - ${bkb2:-0} )); [ "$bdiff" -lt 0 ] && bdiff=0
     RECLAIMED_KB=$(( RECLAIMED_KB + bdiff ))
-    ok "Homebrew cleaned up$( [ "$bdiff" -gt 0 ] && printf ' (%s reclaimed)' "$(human $(( bdiff * 1024 )) )" )"
+    done_ok "Homebrew cleaned up$( [ "$bdiff" -gt 0 ] && printf ' (%s reclaimed)' "$(human $(( bdiff * 1024 )) )" )"
   fi
 fi
 [ "$dev_found" -eq 0 ] && skip "no large developer caches (or skipped)"
@@ -768,9 +943,10 @@ else
     run "speed window resize"     defaults write -g NSWindowResizeTime -float 0.001
     run "disable window anims"    defaults write NSGlobalDomain NSAutomaticWindowAnimationsEnabled -bool false
     # Restart Dock/Finder to pick up changes (race-free); avoid killing cfprefsd.
-    run "restart Dock"            killall Dock 2>/dev/null
-    run "restart Finder"          killall Finder 2>/dev/null
-    ok "UI set to performance mode (undo: System Settings → Accessibility → Display & Motion)"
+    # killall exits 1 when the app isn't running; that's not a failure here.
+    run "restart Dock"            sh -c 'killall Dock 2>/dev/null || true'
+    run "restart Finder"          sh -c 'killall Finder 2>/dev/null || true'
+    done_ok "UI set to performance mode (undo: System Settings → Accessibility → Display & Motion)"
     note "(log out / back in for full effect on WindowServer)"
   else
     skip "UI effects left as-is"
@@ -898,7 +1074,7 @@ fi
 # -- Trend vs the previous run (history survives across runs) --
 if [ -f "$HIST" ]; then
   PREV_LINE=$(tail -1 "$HIST" 2>/dev/null)
-  PREV_SCORE=$(printf '%s' "$PREV_LINE" | awk -F, 'NF>=2 && $2+0==$2 {print $2}')
+  PREV_SCORE=$(printf '%s' "$PREV_LINE" | awk -F, 'NF>=2 && $2~/^[0-9]+$/ {print $2}')
   PREV_DATE=$(printf '%s' "$PREV_LINE" | awk -F, '{print $1}')
   if [ -n "${PREV_SCORE:-}" ]; then
     DELTA=$(( SCORE - PREV_SCORE ))
@@ -921,12 +1097,19 @@ note "What actually moves the needle:"
 [ "${UP_DAYS:-0}" -ge 14 ]   && note "• Restart this Mac — ${UP_DAYS} days of leaked memory and stale state."
 [ -n "${B_CAP:-}" ] && [ "${B_CAP:-100}" -lt 80 ] && note "• Battery at ${B_CAP}% capacity — consider a battery service (System Settings → Battery)."
 if [ "${CR_COUNT:-0}" -gt 5 ] && [ -n "${TOP_CRASHER:-}" ]; then
-  case "$TOP_CRASHER" in
-    com.apple.*) note "• ${TOP_CRASHER} (macOS component) keeps crashing — restart; if it persists, it's an OS/hardware issue." ;;
-    *)           note "• ${TOP_CRASHER} keeps crashing — update, reinstall, or replace it." ;;
-  esac
+  if [ "$TOP_IS_APPLE" = "1" ]; then
+    note "• ${TOP_CRASHER} (macOS component) keeps crashing — restart; if it persists, it's an OS/hardware issue."
+  else
+    note "• ${TOP_CRASHER} keeps crashing — update, reinstall, or replace it."
+  fi
 fi
-[ "${JETSAMS:-0}" -gt 0 ]    && note "• Memory ran out hard enough that macOS killed processes — fewer simultaneous apps, or more RAM."
+if [ "${JETSAMS:-0}" -gt 0 ]; then
+  if [ -n "$JETSAM_TOP" ]; then
+    note "• Memory ran out hard enough that macOS killed processes; the biggest user was ${JETSAM_TOP} — quit it when idle, run fewer apps at once, or add RAM."
+  else
+    note "• Memory ran out hard enough that macOS killed processes — fewer simultaneous apps, or more RAM."
+  fi
+fi
 note "• Trim Login Items: System Settings → General → Login Items (fewer = faster boot & idle)."
 note "• Restart weekly — clears leaked memory and stale state (Apple's own first step)."
 note "• Don't install 'memory cleaner' apps — purging cache makes the next minutes slower."

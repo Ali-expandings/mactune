@@ -21,7 +21,13 @@ PREFIX=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --desktop) DESKTOP=1 ;;
-    --prefix)  shift; PREFIX="${1:-}" ;;
+    --prefix)
+      # A bare --prefix used to shift past the end and crash under set -e.
+      # (Contributed by @yyouretoast, PR #2.)
+      if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+        printf 'install.sh: --prefix needs a directory\n' >&2; exit 64
+      fi
+      shift; PREFIX="$1" ;;
     *) printf 'install.sh: unknown option %s\n' "$1" >&2; exit 64 ;;
   esac
   shift
