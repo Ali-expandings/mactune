@@ -74,15 +74,17 @@ On first run it asks how to handle optional steps: ask each time, yes to everyth
 
 Most "Mac cleaners" delete caches and call it speed. Apple's own slow-Mac guidance and Howard Oakley's macOS internals writing point somewhere else entirely, and that is where MacTune measures:
 
-- **Memory pressure** — the correct metric (not "free RAM", which macOS keeps low by design), plus a live swap-rate sample to catch active thrashing in the act.
+- **Memory pressure** — the correct metric (not "free RAM", which macOS keeps low by design), plus a live swap and compressor sample to catch active thrashing in the act.
 - **Memory by app, truthfully** — a modern browser is 30+ helper processes; per-process lists undercount the real owners. MacTune sums them per app, which is the question you actually opened Activity Monitor to ask.
-- **Jetsam events** — did macOS force-kill anything for memory this week? That is RAM running out, recorded.
+- **Jetsam events** — did macOS force-kill anything for memory this week? That is RAM running out, recorded, along with the app that was using the most memory when it happened.
+- **macOS's own hog reports** — when a process blows through its CPU or disk-write budget, macOS writes it down. MacTune reads those reports and says who it was ("Google Chrome: wrote 8.4 GB to disk in 19 min").
+- **App database bloat** — macOS keeps a registry of every app it has ever seen. In-place updates and deleted installers leave dead entries, and a bloated registry gets rewritten over and over (one test Mac: 1,110 of 2,422 entries dead, 2.1 GB written in 83 minutes).
 - **Disk: fullness, hotspot map, and SMART health** — where the space went (Trash, Downloads, caches, iPhone backups, Docker images, DerivedData), and whether the disk itself is dying — the slowdown nobody checks for.
-- **Battery health** (laptops) — capacity %, cycle count, condition; macOS quietly caps performance when a battery can't deliver power.
-- **Stability scan** — crash reports from the last 7 days with the most frequent crasher named; kernel panics flagged as the hardware/driver red flags they are.
+- **Battery health** (laptops) — capacity %, cycle count, condition. A *failing* battery (condition not Normal) can't deliver peak power, and performance gets limited to match; one that's merely old still delivers full power, it just holds less charge.
+- **Stability scan** — crash reports from the last 7 days with the most frequent crasher named; kernel panics flagged as the hardware/driver red flags they are. Memory kills and non-fatal fault reports aren't counted as crashes, and parts of macOS are recognised as such, so you're never told to "reinstall" a system component.
 - **"Slow right now" detection** — Spotlight mid-index, Time Machine mid-backup, WindowServer working overtime: the honest explanations for today's slowness.
 - **Thermal throttling** — real Intel SMC readings; real `powermetrics` sampling on Apple Silicon. Never a fake "OK" on a platform that doesn't expose the number.
-- **Startup load** — login items and third-party background services, counted, not guessed.
+- **Startup load** — login items and third-party background services, counted, not guessed (apps you have open don't count as services).
 - **Is it even the Mac?** — optional 20-second Apple `networkQuality` test, because half of "my Mac is slow" is the internet.
 
 Everything measured feeds a **health score (0–100, graded A–F)** where every lost point is traceable to a measurement. Each run appends to `~/.config/mactune/history.csv`, so the next run shows your trend.
@@ -91,6 +93,7 @@ Everything measured feeds a **health score (0–100, graded A–F)** where every
 
 - Broken login agents whose programs no longer exist (unloaded, plist → Trash)
 - QuickLook thumbnail cache refresh, DNS resolver cache flush
+- App database cleanup (opt-in, **one-way**, offered only when bloat is measured): forgets registrations whose app no longer exists, then compacts the database. Installed apps and your default-app choices are untouched
 - Developer caches **when present and large** — npm, Xcode DerivedData, pip, Yarn, pnpm, Cargo — each opt-in and moved to Trash *whole*, so it's recoverable until you empty the Trash (unlike the tools' own one-way `clean` commands)
 - Optional UI mode: Reduce Transparency/Motion (measurably lighter on WindowServer; one `--rollback` away from stock)
 - Admin section (opt-in): Time Machine snapshot thinning, `purge` **only under genuine memory pressure** (otherwise it's placebo that slows the next minutes), Spotlight reindex **only when search is measurably slow**, Low Power Mode report
